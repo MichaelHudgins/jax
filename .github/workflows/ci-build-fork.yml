@@ -42,7 +42,7 @@ jobs:
     name: "build ${{ matrix.name-prefix }} (py ${{ matrix.python-version }} on ${{ matrix.os }}, x64=${{ matrix.enable-x64}})"
     runs-on: ${{ matrix.os }}
     container:
-      image: tensorflow/build:${{ matrix.python-version }}
+      image: tensorflow/build:latest-python${{ matrix.python-version }}
     timeout-minutes: 60
     strategy:
       matrix:
