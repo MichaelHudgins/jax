@@ -25,6 +25,7 @@ jobs:
         include:
           - name-prefix: "with 3.12"
             python-version: "3.12"
+            os: linux-arm64
             container: gcr.io/tensorflow-sigs/build-arm64:jax-latest-multi-python
     steps:
     - name: Cancel previous
