@@ -37,4 +37,6 @@ jobs:
     - name: Run tests
       run: |
         uname -a
-        sleep 900
+    - name: Halt if requested
+      run: sleep 150s
+      shell: bash
