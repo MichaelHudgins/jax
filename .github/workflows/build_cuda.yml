@@ -26,7 +26,7 @@ jobs:
           - name-prefix: "with 3.12"
             python-version: "3.12"
             os: linux-x86
-            container: tensorflow/build:latest-python3.12
+            container: nvidia/cuda:12.3.1-devel-ubuntu20.04
     steps:
     - name: Cancel previous
       uses: styfle/cancel-workflow-action@0.12.0
@@ -37,4 +37,4 @@ jobs:
     - name: Run tests
       run: |
         uname -a
-        nvidia-smi        
+        nvidia-smi
