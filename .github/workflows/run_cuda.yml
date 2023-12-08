@@ -26,7 +26,7 @@ jobs:
           - name-prefix: "with 3.12"
             python-version: "3.12"
             os: linux-x86
-            container: nvidia/cuda:12.3.1-devel-ubuntu20.04
+            container: gcr.io/tensorflow-testing/nosla-cuda12.2-cudnn8.9-ubuntu20.04-manylinux2014-multipython
     steps:
     - name: Cancel previous
       uses: styfle/cancel-workflow-action@0.12.0
