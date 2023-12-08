@@ -36,6 +36,42 @@ jobs:
     - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # ratchet:actions/checkout@v4
     - name: Run tests
       run: |
-        uname -a
-        sleep 900
         nvidia-smi
+        python3.12 -m pip install -U pip
+        python3.12 -m pip install jaxlib
+        python3.12 -m pip install -e .
+        python3.12 -m pip install --upgrade \
+          numpy=="1.26.0" scipy=="1.11.2" \
+          wheel pytest-xdist absl-py opt-einsum colorama portpicker \
+          matplotlib 'importlib_metadata>=4.6' hypothesis flatbuffers
+        export LD_LIBRARY_PATH="/usr/local/cuda:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:/usr/local/tensorrt/lib"
+        export NCCL_DEBUG=WARN
+        nvidia-smi
+        export TF_CPP_MIN_LOG_LEVEL=0
+        python3.12 -c "import jax; print(jax.default_backend()); print(jax.devices()); print(len(jax.devices()))"
+        # Runs non-multiaccelerator tests with one GPU apiece.
+        # It appears --run_under needs an absolute path.
+        bazel test \
+          --repo_env=PYTHON_BIN_PATH="$(which python3.12)" \
+          --//jax:build_jaxlib=false \
+          //tests:gpu_tests //tests:backend_independent_tests \
+          --test_env=XLA_PYTHON_CLIENT_ALLOCATOR=platform \
+          --run_under "$(pwd)/build/parallel_accelerator_execute.sh" \
+          --test_output=errors \
+          --test_env=JAX_SKIP_SLOW_TESTS=1 \
+          --test_env=JAX_ACCELERATOR_COUNT=4 \
+          --test_env=JAX_TESTS_PER_ACCELERATOR=8 \
+          --test_env=JAX_EXCLUDE_TEST_TARGETS=PmapTest.testSizeOverflow \
+          --test_tag_filters=-multiaccelerator
+        
+        # Runs multiaccelerator tests with all GPUs.
+        bazel test \
+          --repo_env=PYTHON_BIN_PATH="$(which python3.12)" \
+          --//jax:build_jaxlib=false \
+          //tests:gpu_tests \
+          --test_env=XLA_PYTHON_CLIENT_ALLOCATOR=platform \
+          --test_output=errors \
+          --jobs=8 \
+          --test_env=JAX_SKIP_SLOW_TESTS=1 \
+          --test_tag_filters=multiaccelerator
+        
