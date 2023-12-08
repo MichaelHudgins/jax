@@ -60,7 +60,7 @@ jobs:
           --run_under "$(pwd)/build/parallel_accelerator_execute.sh" \
           --test_output=errors \
           --test_env=JAX_SKIP_SLOW_TESTS=1 \
-          --test_env=JAX_ACCELERATOR_COUNT=4 \
+          --test_env=JAX_ACCELERATOR_COUNT=2 \
           --test_env=JAX_TESTS_PER_ACCELERATOR=8 \
           --test_env=JAX_EXCLUDE_TEST_TARGETS=PmapTest.testSizeOverflow \
           --test_tag_filters=-multiaccelerator
