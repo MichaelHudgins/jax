@@ -45,7 +45,7 @@ jobs:
           numpy=="1.26.0" scipy=="1.11.2" \
           wheel pytest-xdist absl-py opt-einsum colorama portpicker \
           matplotlib 'importlib_metadata>=4.6' hypothesis flatbuffers
-        export LD_LIBRARY_PATH="/usr/local/cuda:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:/usr/local/tensorrt/lib"
+        export LD_LIBRARY_PATH="/usr/local/cuda:/usr/local/nvidia/lib64:/usr/local/cuda/extras/CUPTI/lib64:/usr/local/tensorrt/lib"
         export NCCL_DEBUG=WARN
         nvidia-smi
         export TF_CPP_MIN_LOG_LEVEL=0
