@@ -15,7 +15,7 @@ permissions:
 jobs:
   build:
     name: "build ${{ matrix.name-prefix }} py ${{ matrix.python-version }} CUDA"
-    runs-on: "linux-gpu-medium"
+    runs-on: "linux-gpu-2"
     container:
         image: ${{ matrix.container }}
     timeout-minutes: 60
