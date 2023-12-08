@@ -36,10 +36,8 @@ jobs:
     - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # ratchet:actions/checkout@v4
     - name: Run tests
       run: |
+        set -x
         nvidia-smi
-        dpkg -l | grep nvidia
-        dpkg -l | grep cuda
-        dmesg | grep NVIDIA
         python3.12 -m pip install -U pip
         python3.12 -m pip install jaxlib
         python3.12 -m pip install -e .
