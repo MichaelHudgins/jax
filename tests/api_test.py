@@ -56,6 +56,7 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.lib import xla_client
 from jax._src.lib import xla_extension
+from jax._src.lib import xla_extension_version
 import jax._src.util as jax_util
 from jax.ad_checkpoint import checkpoint_name, checkpoint as new_checkpoint
 import jax.custom_batching
@@ -4446,6 +4447,21 @@ class APITest(jtu.JaxTestCase):
     if (x_ptr & 15) != 0:
       self.assertTrue(np.shares_memory(out, x))
 
+  def test_mesh_creation_error_message(self):
+    with self.assertRaisesRegex(ValueError, "ndim of its first argument"):
+      jax.sharding.Mesh(jax.devices(), ("x", "y"))
+
+  @unittest.skipIf(xla_extension_version < 222, 'jaxlib version too old')
+  def test_jit_boundmethod_reference_cycle(self):
+    class A:
+      def __init__(self):
+        self._foo = jax.jit(self.foo)
+      def foo(self):
+        pass
+    a = weakref.ref(A())
+    gc.collect()
+    assert a() is None
+
 
 class RematTest(jtu.JaxTestCase):
 
@@ -6196,6 +6212,14 @@ class JaxprTest(jtu.JaxTestCase):
     cet = partial(lax.convert_element_type, new_dtype='float16')
     jaxpr = api.make_jaxpr(lambda: cet(3.))()
     self.assertLen(jaxpr.eqns, 0)
+
+  def test_eqn_repr_with_no_lhs(self):
+    def f(x):
+      jax.debug.print("{}", x)
+      return x
+    jaxpr = jax.make_jaxpr(f)(np.int32(0))
+    self.assertEqual(jaxpr.eqns[0].primitive, jax._src.debugging.debug_callback_p)
+    self.assertStartsWith(str(jaxpr.eqns[0]), "debug_callback[", )
 
 
 class DCETest(jtu.JaxTestCase):

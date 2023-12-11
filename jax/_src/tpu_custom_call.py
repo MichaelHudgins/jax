@@ -34,7 +34,7 @@ from jax import core
 from jax._src import config
 from jax._src.lib import tpu_mosaic
 from jax._src.lib import xla_client
-from jax.interpreters import mlir
+from jax._src.interpreters import mlir
 from jax.interpreters import xla
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import mhlo
@@ -182,7 +182,7 @@ def _tpu_custom_call_lowering(
           " call in a shard_map or xmap."
       )
   elif isinstance(axis_context, sharding_impls.ShardingContext):
-    if len(axis_context.device_assignment) != 1:
+    if axis_context.num_devices != 1:
       raise NotImplementedError(
           "Mosaic kernels cannot be automatically partitioned. Please wrap the"
           " call in a shard_map or xmap."
@@ -288,6 +288,8 @@ def _lower_tpu_kernel(
   with ir.Context() as ctx, ir.Location.unknown():
     vector_constants = []
 
+    ctx.append_dialect_registry(mlir.upstream_dialects)
+    ctx.load_all_available_dialects()
     tpu.register_dialect(ctx)
     mhlo.register_mhlo_dialect(ctx)
     mhlo.register_mhlo_passes()

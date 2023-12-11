@@ -18,7 +18,8 @@ from __future__ import annotations
 from functools import partial
 import itertools as it
 
-from typing import Any, Callable, Dict, Sequence, Tuple
+from typing import Any, Callable
+from collections.abc import Sequence
 
 import jax
 from jax import api_util
@@ -79,10 +80,17 @@ def _maybe_dynamic_update_slice(start_idx, block_shape, value, update,
   assert update.shape == block_shape
   return lax.dynamic_update_slice(value, update, start_idx)
 
+def _uninitialized_value(shape, dtype):
+  if jnp.issubdtype(dtype, jnp.floating):
+    return jnp.full(shape, jnp.nan, dtype)
+  elif jnp.issubdtype(dtype, jnp.integer):
+    return jnp.full(shape, jnp.iinfo(dtype).min, dtype)
+  raise NotImplementedError(dtype)
+
 def _pallas_call_impl(*args, jaxpr, name, out_shapes, which_linear,
                       interpret, debug: bool,
                       in_shapes,
-                      input_output_aliases: Tuple[Tuple[int, int], ...],
+                      input_output_aliases: tuple[tuple[int, int], ...],
                       grid_mapping: GridMapping,
                       **compiler_params: Any):
   if interpret:
@@ -100,13 +108,33 @@ def _pallas_call_impl(*args, jaxpr, name, out_shapes, which_linear,
       if i in oi_map:
         out.append(args[oi_map[i]])
       else:
+        # TODO(sharadmv): use unitialized values for outputs
         out.append(jnp.zeros(out_shape.shape, out_shape.dtype))
     scalars, args = split_list(args, [grid_mapping.num_index_operands])  # type: ignore
-    carry = [*args, *out]
+    # invars: [*scalar_prefetch, *inputs, *outputs, *scratch]
+    num_invars = len(jaxpr.invars)
+    num_inputs_outputs = (
+        num_invars
+        - grid_mapping.num_index_operands
+        - grid_mapping.num_scratch_operands
+    )
+    _, _, scratch_invars = split_list(
+        jaxpr.invars, [grid_mapping.num_index_operands, num_inputs_outputs]
+    )
+    scratch_avals = [v.aval for v in scratch_invars]
+    if not all(
+        hasattr(a, "shape") and hasattr(a, "dtype") for a in scratch_avals
+    ):
+      raise NotImplementedError(f"Cannot initialize scratch: {scratch_avals}")
+    scratch_values = [_uninitialized_value(a.shape, a.dtype)
+                      for a in scratch_avals]
+    carry = [*args, *out, *scratch_values]
+    num_carry = len(args) + len(out)
     def cond(carry):
       return carry[0] < loop_indices.shape[0]
     def body(carry):
       i, *carry = carry
+      carry, scratch = split_list(carry, [num_carry])
       loop_idx = loop_indices[i]
       start_indices = [
           None if bm is None else bm.compute_start_indices(loop_idx, *scalars)
@@ -130,14 +158,23 @@ def _pallas_call_impl(*args, jaxpr, name, out_shapes, which_linear,
       local_grid_env, _ = partition_list(is_mapped_grid_dim,
                                          zip(loop_idx, grid_mapping.grid))
       with pallas_core.grid_env(tuple(local_grid_env)):
+        assert len(discharged_jaxpr.invars) == len(scalars) + len(blocks) + len(
+            scratch_values
+        ), (
+            len(discharged_jaxpr.invars),
+            len(scalars),
+            len(blocks),
+            len(scratch_values),
+        )
         blocks = jax.core.eval_jaxpr(discharged_jaxpr, consts, *scalars,
-                                     *blocks)
+                                     *blocks, *scratch)
       blocks = blocks[grid_mapping.num_index_operands:]
+      blocks, out_scratch = split_list(blocks, [num_carry])
       carry = map(_maybe_dynamic_update_slice, start_indices, block_shapes,
                   carry, blocks, is_indexing_dim)
-      return (i + 1, *carry)
+      return (i + 1, *carry, *out_scratch)
     (_, *carry) = lax.while_loop(cond, body, (0, *carry))
-    _, out = split_list(carry, [len(args)])
+    _, out, _ = split_list(carry, [len(args), len(out)])
     return out
   return xla.apply_primitive(pallas_call_p, *args, jaxpr=jaxpr, name=name,
                              in_shapes=in_shapes,
@@ -153,7 +190,7 @@ def _pallas_call_abstract_eval(*avals, out_shapes, **_):
 pallas_call_p.def_abstract_eval(_pallas_call_abstract_eval)
 
 def _pallas_call_jvp_rule(primals, tangents, *, jaxpr, name, which_linear,
-    input_output_aliases: Tuple[Tuple[int, int], ...],
+    input_output_aliases: tuple[tuple[int, int], ...],
     in_shapes, out_shapes, grid_mapping, debug, interpret, **compiler_params: Any):
   if grid_mapping.num_index_operands:
     raise NotImplementedError
@@ -200,7 +237,7 @@ def _pallas_call_jvp_rule(primals, tangents, *, jaxpr, name, which_linear,
   return out_primals, out_tangents
 ad.primitive_jvps[pallas_call_p] = _pallas_call_jvp_rule
 
-def _batch_block_mapping(grid: Tuple[int, ...], aval: jax_core.ShapedArray,
+def _batch_block_mapping(grid: tuple[int, ...], aval: jax_core.ShapedArray,
                          dim: int | batching.NotMapped,
                          block_mapping: BlockMapping | None) -> BlockMapping:
   def _block_map_function(new_idx, *args):
@@ -235,13 +272,13 @@ def _batch_block_mapping(grid: Tuple[int, ...], aval: jax_core.ShapedArray,
 def _pallas_call_batching_rule(args, dims, *,
                                jaxpr: jax_core.Jaxpr,
                                name: str,
-                               in_shapes: Tuple[jax.ShapeDtypeStruct, ...],
-                               out_shapes: Tuple[jax.ShapeDtypeStruct, ...],
+                               in_shapes: tuple[jax.ShapeDtypeStruct, ...],
+                               out_shapes: tuple[jax.ShapeDtypeStruct, ...],
                                grid_mapping: GridMapping,
-                               input_output_aliases: Tuple[Tuple[int, int], ...],
+                               input_output_aliases: tuple[tuple[int, int], ...],
                                debug: bool,
                                interpret: bool,
-                               which_linear: Tuple[bool, ...],
+                               which_linear: tuple[bool, ...],
                                **compiler_params: Any):
   if grid_mapping.num_index_operands:
     scalar_batch_dims = dims[:grid_mapping.num_index_operands]
@@ -275,9 +312,18 @@ def _pallas_call_batching_rule(args, dims, *,
   all_dims = list(dims) + [0] * len(out_shapes)
 
   num_index_operands = grid_mapping.num_index_operands
+  num_scratch_operands = grid_mapping.num_scratch_operands
+
+  # Only add a batch dimension for the avals that actually have a grid mapping.
+  # This excludes scalar prefetch inputs (the first in the list) and scratch
+  # operands (the last in the list).
+  avals_to_batch = avals[num_index_operands:(len(avals) - num_scratch_operands)]
   batched_block_mappings = map(
       partial(_batch_block_mapping, grid_mapping.grid),
-      avals[num_index_operands:], all_dims[num_index_operands:], block_mappings)
+      avals_to_batch,
+      all_dims[num_index_operands:],
+      block_mappings,
+  )
 
   batched_in_shapes = tuple(
       jax.ShapeDtypeStruct(x.shape if dim is batching.not_mapped else
@@ -383,7 +429,7 @@ def pallas_call(
     in_specs: Sequence[BlockSpec | NoBlockSpec] | NoBlockSpec = no_block_spec,
     out_specs: BlockSpec | NoBlockSpec
     | Sequence[BlockSpec | NoBlockSpec] = no_block_spec,
-    input_output_aliases: Dict[int, int] = {},
+    input_output_aliases: dict[int, int] = {},
     interpret: bool = False,
     name: str | None = None,
     **compiler_params: Any,

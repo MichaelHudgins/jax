@@ -199,10 +199,6 @@ class ShardingMemoriesTest(jtu.JaxTestCase):
 class MemoriesComputationTest(jtu.BufferDonationTestCase):
 
   def setUp(self):
-    # TODO(yashkatariya): Enable all tests after memories XLA support is
-    # working.
-    self.skipTest('Enable after memories work with redesigned XLA support.')
-
     if not jtu.test_device_matches(["tpu"]):
       self.skipTest("Memories do not work on CPU and GPU backends yet.")
     # TODO(b/311021572)
@@ -270,7 +266,7 @@ class MemoriesComputationTest(jtu.BufferDonationTestCase):
 
     expected_out = np_inp * 2
     self.assertArraysEqual(out, expected_out)
-    self.assertEqual(out.sharding, s.with_memory_kind(("unpinned_host")))
+    self.assertEqual(out.sharding, s.with_memory_kind("unpinned_host"))
     self._check_mem_kind(executable_mk[0], out.sharding, "unpinned_host")
     for s in out.addressable_shards:
       self.assertArraysEqual(s.data, expected_out[s.index])
@@ -1046,38 +1042,19 @@ class MemoriesComputationTest(jtu.BufferDonationTestCase):
 
   def test_single_mem_kind_donation_default_mem_kind(self):
     mesh = jtu.create_global_mesh((2,), "x")
+    s = NamedSharding(mesh, P())
 
-    @functools.partial(jax.jit, donate_argnums=0)
+    @functools.partial(jax.jit, out_shardings=s, donate_argnums=0)
     def f(inp1):
       return inp1 * 2
 
-    x = jax.device_put(np.arange(16).reshape(8, 2), NamedSharding(mesh, P()))
+    x = jax.device_put(np.arange(16).reshape(8, 2), s)
 
     f(x)
 
     lowered_text = f.lower(x).as_text("hlo")
     self.assertIn("input_output_alias", lowered_text)
     self.assertDeleted(x)
-
-  def test_single_mem_kind_donation_host(self):
-    if xb.using_pjrt_c_api():
-      raise unittest.SkipTest("GetOutputShardings not supported in PJRT C API")
-    mesh = jtu.create_global_mesh((2,), "x")
-
-    @functools.partial(jax.jit, donate_argnums=0)
-    def f(inp1):
-      return inp1 * 2
-
-    s_host = NamedSharding(mesh, P(), memory_kind="unpinned_host")
-    x = jax.device_put(np.arange(16).reshape(8, 2), s_host)
-
-    f(x)
-
-    lowered_text = f.lower(x).as_text("hlo")
-    self.assertIn("input_output_alias", lowered_text)
-    # TODO(yashkatariya): Donation does not work on host memory yet. Uncomment
-    # this after it is fixed.
-    # self.assertDeleted(x)
 
   def test_host_offload_in_custom_vjp(self):
     if xb.using_pjrt_c_api():

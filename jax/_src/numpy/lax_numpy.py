@@ -32,8 +32,7 @@ from functools import partial
 import math
 import operator
 import types
-from typing import (overload, Any, Callable, Literal, NamedTuple, Optional,
-                    Protocol, TypeVar, Union)
+from typing import (overload, Any, Callable, Literal, NamedTuple, Protocol, TypeVar, Union)
 from textwrap import dedent as _dedent
 import warnings
 
@@ -1404,8 +1403,13 @@ def nonzero(a: ArrayLike, *, size: int | None = None,
             fill_value: None | ArrayLike | tuple[ArrayLike, ...] = None
     ) -> tuple[Array, ...]:
   util.check_arraylike("nonzero", a)
-  arr = atleast_1d(a)
+  arr = asarray(a)
   del a
+  if ndim(arr) == 0:
+    # Added 2023 Dec 6
+    warnings.warn("Calling nonzero on 0d arrays is deprecated. Use `atleast_1d(arr).nonzero()",
+                  DeprecationWarning, stacklevel=2)
+  arr = atleast_1d(arr)
   mask = arr if arr.dtype == bool else (arr != 0)
   calculated_size = mask.sum() if size is None else size
   calculated_size = core.concrete_dim_or_error(calculated_size,
@@ -2438,7 +2442,7 @@ def identity(n: DimSize, dtype: DTypeLike | None = None) -> Array:
    ``(jnp.arange(-600, 600) * .01).astype(jnp.bfloat16)`` to generate a sequence in a higher precision
    and then convert it to the desired lower precision.
 """)
-def arange(start: DimSize, stop: Optional[DimSize] = None,
+def arange(start: DimSize, stop: DimSize | None = None,
            step: DimSize | None = None, dtype: DTypeLike | None = None) -> Array:
   dtypes.check_user_dtype_supported(dtype, "arange")
   if not config.dynamic_shapes.value:
@@ -2475,8 +2479,7 @@ def arange(start: DimSize, stop: Optional[DimSize] = None,
     return lax.iota(dtype, start)
   else:
     if step is None and start == 0 and stop is not None:
-      stop = np.ceil(stop).astype(int)
-      return lax.iota(dtype, stop)
+      return lax.iota(dtype, np.ceil(stop).astype(int))
     return array(np.arange(start, stop=stop, step=step, dtype=dtype))
 
 
@@ -2499,7 +2502,7 @@ def _arange_dynamic(
         f"be resolved statically if it is > 0 or < 0.\nDetails: {e}")
   gap = step if step_gt_0 else - step
   distance = (stop - start) if step_gt_0 else (start - stop)
-  size = core.non_negative_dim(distance + gap - 1) // gap
+  size = core.max_dim(0, distance + gap - 1) // gap
   return (array(start, dtype=dtype) +
           array(step, dtype=dtype) * lax.iota(dtype, size))
 
@@ -2828,7 +2831,7 @@ def repeat(a: ArrayLike, repeats: ArrayLike, axis: int | None = None, *,
 
 
 @util._wraps(np.tri)
-def tri(N: int, M: int | None = None, k: int = 0, dtype: Optional[DTypeLike] = None) -> Array:
+def tri(N: int, M: int | None = None, k: int = 0, dtype: DTypeLike | None = None) -> Array:
   dtypes.check_user_dtype_supported(dtype, "tri")
   M = M if M is not None else N
   dtype = dtype or float32
@@ -3437,7 +3440,6 @@ def einsum(
     optimize: str = "optimal",
     precision: PrecisionLike = None,
     preferred_element_type: DTypeLike | None = None,
-    _use_xeinsum: bool = False,
     _dot_general: Callable[..., Array] = lax.dot_general,
 ) -> Array: ...
 
@@ -3450,7 +3452,6 @@ def einsum(
     optimize: str = "optimal",
     precision: PrecisionLike = None,
     preferred_element_type: DTypeLike | None = None,
-    _use_xeinsum: bool = False,
     _dot_general: Callable[..., Array] = lax.dot_general,
 ) -> Array: ...
 
@@ -3462,20 +3463,13 @@ def einsum(
     optimize: str = "optimal",
     precision: PrecisionLike = None,
     preferred_element_type: DTypeLike | None = None,
-    _use_xeinsum: bool = False,
     _dot_general: Callable[..., Array] = lax.dot_general,
 ) -> Array:
   operands = (subscripts, *operands)
   if out is not None:
     raise NotImplementedError("The 'out' argument to jnp.einsum is not supported.")
-
   spec = operands[0] if isinstance(operands[0], str) else None
-
-  if (_use_xeinsum or spec is not None and '{' in spec):
-    return jax.named_call(lax.xeinsum, name=spec)(*operands)
-
   optimize = 'optimal' if optimize is True else optimize
-  # using einsum_call=True here is an internal api for opt_einsum
 
   # Allow handling of shape polymorphism
   non_constant_dim_types = {
@@ -3487,15 +3481,17 @@ def einsum(
   else:
     ty = next(iter(non_constant_dim_types))
     contract_path = _poly_einsum_handlers.get(ty, _default_poly_einsum_handler)
+  # using einsum_call=True here is an internal api for opt_einsum... sorry
   operands, contractions = contract_path(
         *operands, einsum_call=True, use_blas=True, optimize=optimize)
 
   contractions = tuple((a, frozenset(b), c) for a, b, c, *_ in contractions)
 
-  _einsum_computation = jax.named_call(
-      _einsum, name=spec) if spec is not None else _einsum
-  return _einsum_computation(operands, contractions, precision,  # type: ignore[operator]
-                             preferred_element_type, _dot_general)
+  einsum = jit(_einsum, static_argnums=(1, 2, 3, 4), inline=True)
+  if spec is not None:
+    einsum = jax.named_call(einsum, name=spec)
+  return einsum(operands, contractions, precision,  # type: ignore[operator]
+                preferred_element_type, _dot_general)
 
 
 # Enable other modules to override einsum_contact_path.
@@ -3520,7 +3516,6 @@ def _removechars(s, chars):
   return s.translate(str.maketrans(dict.fromkeys(chars)))
 
 
-@partial(jit, static_argnums=(1, 2, 3, 4), inline=True)
 def _einsum(
     operands: Sequence,
     contractions: Sequence[tuple[tuple[int, ...], frozenset[str], str]],
@@ -3928,7 +3923,7 @@ def sort_complex(a: ArrayLike) -> Array:
 
 @util._wraps(np.lexsort)
 @partial(jit, static_argnames=('axis',))
-def lexsort(keys: Union[Array, np.ndarray, Sequence[ArrayLike]], axis: int = -1) -> Array:
+def lexsort(keys: Array | np.ndarray | Sequence[ArrayLike], axis: int = -1) -> Array:
   key_tuple = tuple(keys)
   # TODO(jakevdp): Non-array input deprecated 2023-09-22; change to error.
   util.check_arraylike("lexsort", *key_tuple, emit_warning=True)
@@ -4965,18 +4960,14 @@ def _preprocess_slice(
           f"be resolved statically if it is >= 0.\nDetails: {e}")
     if i_ge_0:
       if step_gt_0:
-        # min(i, axis_size)
-        return axis_size - core.non_negative_dim(axis_size - i)
+        return core.min_dim(axis_size, i)
       else:
-        # min(i, axis_size - 1)
-        return axis_size - 1 - core.non_negative_dim(axis_size - 1 - i)
+        return core.min_dim(axis_size - 1, i)
     else:
       if step_gt_0:
-        # max(axis_size + i, 0)
-        return core.non_negative_dim(axis_size + i)
+        return core.max_dim(0, axis_size + i)
       else:
-        # max(axis_size + i, -1)
-        return -1 + core.non_negative_dim(axis_size + i + 1)
+        return core.max_dim(-1, axis_size + i)
 
   if s.start is None:
     start = 0 if step_gt_0 else axis_size - 1
@@ -4990,7 +4981,7 @@ def _preprocess_slice(
 
   gap = step if step_gt_0 else - step
   distance = (stop - start) if step_gt_0 else (start - stop)
-  slice_size = core.non_negative_dim(distance + gap - 1) // gap
+  slice_size = core.max_dim(0, distance + gap - 1) // gap
   return start, step, slice_size
 
 

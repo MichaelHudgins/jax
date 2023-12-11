@@ -18,6 +18,7 @@ import re
 from functools import partial, lru_cache
 import logging
 import math
+import textwrap
 import threading
 import unittest
 
@@ -58,6 +59,7 @@ from jax.interpreters import mlir
 from jax._src import xla_bridge
 from jax._src.lib import xla_client as xc
 from jax._src.lib import xla_extension
+from jax._src.lib import xla_extension_version
 from jax._src.util import curry, unzip2, safe_zip
 
 config.parse_flags_with_absl()
@@ -391,6 +393,74 @@ class PJitTest(jtu.BufferDonationTestCase):
     jax.tree_map(self.assertNotDeleted, x_tree)
     jax.tree_map(self.assertDeleted, y_tree)
     jax.tree_map(self.assertNotDeleted, z_tree)
+
+  @unittest.skipIf(xla_extension_version < 220, 'jaxlib version too old')
+  @jtu.run_on_devices('tpu', 'cpu', 'gpu')
+  def testBufferDonationWithOutputShardingInference(self):
+    mesh = jtu.create_global_mesh((2,), 'x')
+    s = NamedSharding(mesh, P('x'))
+    rs = NamedSharding(mesh, P())
+
+    @partial(pjit, donate_argnames=('inp2', 'inp3'))
+    def f(inp1, inp2, inp3):
+      return (
+          jax.lax.with_sharding_constraint(inp1, rs),
+          inp1,
+          jax.lax.with_sharding_constraint(inp2, rs),
+          inp2,
+          jax.lax.with_sharding_constraint(inp3, rs),
+          inp3,
+      )
+
+    x = np.ones((2, 5)) * 4
+    x_tree = jax.device_put({'a': {'b': x}, 'c': x}, s)
+
+    y = np.ones((2, 7)) * 2
+    y_tree = jax.device_put({'a': {'b': y}, 'c': y}, s)
+
+    z = np.ones((2, 11))
+    z_tree = jax.device_put({'a': {'b': z}, 'c': z}, s)
+
+    out = f(x_tree, y_tree, z_tree)
+    jax.tree_map(self.assertNotDeleted, x_tree)
+    jax.tree_map(self.assertDeleted, y_tree)
+    jax.tree_map(self.assertDeleted, z_tree)
+
+  @unittest.skipIf(xla_extension_version < 220, 'jaxlib version too old')
+  @jtu.run_on_devices('tpu')
+  def testBufferDonationWithOutputShardingInferenceAndTokens(self):
+    mesh = jtu.create_global_mesh((2,), 'x')
+    s = NamedSharding(mesh, P('x'))
+
+    def _callback(x):
+      self.assertIs(type(x), np.ndarray)
+
+    @partial(pjit, donate_argnames=('x'))
+    def f(x):
+      # Just to get tokens.
+      jax.experimental.io_callback(_callback, None, x, ordered=True)
+      jax.experimental.io_callback(_callback, None, x, ordered=True)
+      return x * x
+
+    x = np.ones((2, 5)) * 4
+    x = jax.device_put(x, s)
+    f(x)
+    jax.effects_barrier()
+    self.assertDeleted(x)
+
+  @unittest.skipIf(xla_extension_version < 220, 'jaxlib version too old')
+  @jtu.run_on_devices('tpu', 'cpu', 'gpu')
+  def testBufferDonationNotDonated(self):
+    mesh = jtu.create_global_mesh((2,), 'x')
+    s = NamedSharding(mesh, P('x'))
+
+    @partial(pjit, donate_argnames=('x'))
+    def f(x):
+      return x @ x.T
+
+    x = jax.device_put(np.arange(16).reshape(8, 2), s)
+    f(x)
+    self.assertNotDeleted(x)
 
   @jtu.with_mesh([('x', 2), ('y', 1)])
   def testShardingConstraintStablehlo(self):
@@ -1223,6 +1293,19 @@ class PJitTest(jtu.BufferDonationTestCase):
           r"spec=PartitionSpec\(None, \('mdl',\), None, None\).*\) is only "
           "valid for values of rank at least 4, but was applied to a value of rank 1"):
         pjit_f(jnp.array([1, 2, 3]))
+
+  def test_pretty_print(self):
+    f = pjit(lambda x: x)
+    x = jnp.array([4.2], dtype=jnp.float32)
+    jaxpr = jax.make_jaxpr(f)(x)
+    self.assertEqual(
+        jaxpr.pretty_print(),
+        textwrap.dedent("""
+            { lambda ; a:f32[1]. let
+                b:f32[1] = pjit[name=<lambda> jaxpr={ lambda ; c:f32[1]. let  in (c,) }] a
+              in (b,) }
+        """).strip(),
+    )
 
 
 @jtu.pytest_mark_if_available('multiaccelerator')
@@ -3686,6 +3769,52 @@ class ArrayPjitTest(jtu.JaxTestCase):
 
     with mesh:
       f()  # doesn't crash
+
+  def test_lowering_cache_hit_different_devices(self):
+    if jax.device_count() < 4:
+      self.skipTest('Requires >=4 devices')
+
+    mesh1 = jax.sharding.Mesh(jax.devices()[:2], 'x')
+    mesh2 = jax.sharding.Mesh(jax.devices()[2:4], 'y')
+
+    @jax.jit
+    def f(x):
+      return x * 2
+
+    def g(a):
+      a = jax.device_put(a, NamedSharding(mesh1, P('x')))
+      out_a = f(a)  # lowering cached
+
+      # same num_devices but different devices.
+      b = jax.device_put(out_a, NamedSharding(mesh2, P('y')))
+      f(b)  # lowering cache *hit*
+
+    with jtu.count_jit_and_pmap_compiles() as count:
+      g(np.arange(8))
+    self.assertEqual(count[0], 1)
+
+  def test_lowering_cache_miss_different_devices_and_sharding(self):
+    if jax.device_count() < 4:
+      self.skipTest('Requires >=4 devices')
+
+    mesh1 = jax.sharding.Mesh(jax.devices()[:2], 'x')
+    mesh2 = jax.sharding.Mesh(jax.devices()[2:4], 'y')
+
+    @jax.jit
+    def f(x):
+      return x * 2
+
+    def g(a):
+      a = jax.device_put(a, NamedSharding(mesh1, P('x')))
+      out_a = f(a)  # lowering cached
+
+      # same num_devices but different devices and sharding
+      b = jax.device_put(out_a, NamedSharding(mesh2, P()))
+      f(b)  # lowering cache *miss*
+
+    with jtu.count_jit_and_pmap_compiles() as count:
+      g(np.arange(8))
+    self.assertEqual(count[0], 2)
 
 
 class TempSharding(Sharding):

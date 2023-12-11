@@ -929,7 +929,7 @@ class XMapTestManualSPMD(ManualSPMDTestMixin, XMapTestCase):
              in_axes=['i', None], out_axes=[None],
              axis_resources={'i': 'x'})
     h = pjit(f, in_shardings=P('x', None), out_shardings=P(None))(x)
-    assert (h.addressable_data(0) == x.reshape(8)).all()
+    self.assertArraysEqual(h.addressable_data(0), x.reshape(8))
 
   @parameterized.named_parameters(
   {'testcase_name': name, 'mesh': mesh}
@@ -949,7 +949,7 @@ class XMapTestManualSPMD(ManualSPMDTestMixin, XMapTestCase):
         out_shardings=P('x', None),
     )(x)
 
-    assert (h.addressable_data(0).reshape(4) == x[0, :]*2).all()
+    self.assertArraysEqual(h.addressable_data(0).reshape(4), x[0, :] * 2)
 
   @jtu.with_mesh([('x', 2)])
   def testBareXmapCollective(self):
@@ -1455,7 +1455,7 @@ class PDotTests(XMapTestCase):
     rng = self.rng()
     x = rng.randn(3)
     y = rng.randn(3)
-    out = xmap(partial(jnp.einsum, '{i},{i}->'),
+    out = xmap(partial(lax.xeinsum, '{i},{i}->'),
                in_axes=(['i'], ['i']), out_axes=[])(x, y)
     expected = np.einsum('i,i->', x, y)
     self.assertAllClose(out, expected, check_dtypes=False)
@@ -1464,7 +1464,7 @@ class PDotTests(XMapTestCase):
     rng = self.rng()
     x = rng.randn(3)
     y = rng.randn(3)
-    out = xmap(partial(jnp.einsum, '{i},{j}->{i,j}'),
+    out = xmap(partial(lax.xeinsum, '{i},{j}->{i,j}'),
                in_axes=(['i'], ['j']), out_axes=['i', 'j'])(x, y)
     expected = np.einsum('i,j->ij', x, y)
     self.assertAllClose(out, expected, check_dtypes=True)
@@ -1476,7 +1476,7 @@ class PDotTests(XMapTestCase):
     y = rng.randn(4, 5)
 
     def check(spec):
-      out = xmap(partial(jnp.einsum, spec),
+      out = xmap(partial(lax.xeinsum, spec),
                  in_axes=(['i', 'j'], ['j', 'k']),
                  out_axes=['i', 'k'])(x, y)
       expected = np.einsum('ij,jk->ik', x, y)
@@ -1491,7 +1491,7 @@ class PDotTests(XMapTestCase):
     rng = self.rng()
     x = rng.randn(3)
     y = rng.randn(3)
-    out = jnp.einsum('i,i->', x, y, _use_xeinsum=True)
+    out = jnp.einsum('i,i->', x, y)
     expected = np.einsum('i,i->', x, y)
     self.assertAllClose(out, expected, check_dtypes=False)
 
@@ -1499,7 +1499,7 @@ class PDotTests(XMapTestCase):
     rng = self.rng()
     x = rng.randn(3, 2)
     y = rng.randn(3, 2)
-    out = jnp.einsum('ij,ij->i', x, y, _use_xeinsum=True)
+    out = lax.xeinsum('ij,ij->i', x, y)
     expected = np.einsum('ij,ij->i', x, y)
     self.assertAllClose(out, expected, check_dtypes=True)
 
@@ -1508,7 +1508,7 @@ class PDotTests(XMapTestCase):
     rng = np.random.RandomState(0)
     x = rng.randn(3, 5, 4)
     y = rng.randn(3, 4, 2)
-    out = jnp.einsum('bij,bjk->bik', x, y, _use_xeinsum=True)
+    out = lax.xeinsum('bij,bjk->bik', x, y)
     expected = np.einsum('bij,bjk->bik', x, y)
     self.assertAllClose(out, expected, check_dtypes=True)
 
@@ -1516,7 +1516,7 @@ class PDotTests(XMapTestCase):
     rng = self.rng()
     x = rng.randn(3)
     y = rng.randn()
-    out = jnp.einsum('i,->', x, y, _use_xeinsum=True)
+    out = lax.xeinsum('i,->', x, y)
     expected = np.einsum('i,->', x, y)
     self.assertAllClose(out, expected, check_dtypes=True)
 
@@ -1526,7 +1526,7 @@ class PDotTests(XMapTestCase):
     rng = np.random.RandomState(0)
     x = rng.randn(3, 5, 4)
     y = rng.randn(2, 4, 2)
-    out = jnp.einsum('bij,cjk->ik', x, y, _use_xeinsum=True)
+    out = lax.xeinsum('bij,cjk->ik', x, y)
     expected = np.einsum('bij,cjk->ik', x, y)
     self.assertAllClose(out, expected, check_dtypes=True)
 
@@ -1537,7 +1537,7 @@ class PDotTests(XMapTestCase):
     y = rng.randn(5,)
 
     def check(spec):
-      out = xmap(partial(jnp.einsum, spec),
+      out = xmap(partial(lax.xeinsum, spec),
                  in_axes=(['i', 'j'], ['k']),
                  out_axes=['i', 'k'])(x, y)
       expected = np.einsum('ij,k->ik', x, y)
@@ -1552,7 +1552,7 @@ class PDotTests(XMapTestCase):
     y = rng.randn(8,)
 
     def check(spec):
-      out = xmap(partial(jnp.einsum, spec),
+      out = xmap(partial(lax.xeinsum, spec),
                  in_axes=(['i', 'j'], ['k']),
                  out_axes=['i', 'k'],
                  axis_resources={'i': 'x', 'k': 'y'})(x, y)
@@ -1572,7 +1572,7 @@ class PDotTests(XMapTestCase):
     y = rng.randn(8, 4, 5)
 
     def check(spec):
-      out = xmap(partial(jnp.einsum, spec),
+      out = xmap(partial(lax.xeinsum, spec),
                  in_axes=(['b', 'i', 'j'], ['b', 'j', 'k']),
                  out_axes=['b', 'i', 'k'],
                  axis_resources={'b': 'x', 'j': 'y'})(x, y)
@@ -1589,7 +1589,7 @@ class PDotTests(XMapTestCase):
     x = rng.randn(8, 6, 4)
 
     def check(spec):
-      out = xmap(partial(jnp.einsum, spec),
+      out = xmap(partial(lax.xeinsum, spec),
                  in_axes=['b', 'i', 'j'],
                  out_axes=['b'],
                  axis_resources={'b': 'x', 'i': 'y'})(x)
@@ -1607,7 +1607,7 @@ class PDotTests(XMapTestCase):
     x = rng.randn(8, 6, 4, 5)
 
     def check(spec):
-      out = xmap(partial(jnp.einsum, spec),
+      out = xmap(partial(lax.xeinsum, spec),
                  in_axes=['b', 'i', ...],
                  out_axes=['b', ...],
                  axis_resources={'b': 'x', 'i': 'y'})(x)

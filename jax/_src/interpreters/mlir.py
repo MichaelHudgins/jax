@@ -25,8 +25,10 @@ import itertools
 import operator
 import re
 import typing
-from typing import Any, Callable, NamedTuple, Optional, Protocol, Union
+from typing import Any, Callable, NamedTuple, Protocol, Union
 import warnings
+
+import numpy as np
 
 from jax._src import ad_util
 from jax._src import config
@@ -44,13 +46,13 @@ from jax._src.interpreters import xla
 from jax._src.layout import XLACompatibleLayout, LayoutRequest
 from jax._src.lib import xla_client as xc
 from jax._src.lib import xla_extension
+from jax._src.lib import xla_extension_version
 from jax._src.lib.mlir import dialects
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func as func_dialect
 from jax._src.lib.mlir.dialects import hlo
+from jax._src.lib.mlir import register_jax_dialects
 from jax._src.sharding_impls import XLACompatibleSharding
-import numpy as np
-
 
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
@@ -364,11 +366,16 @@ def _source_info_to_location(
   # TODO(phawkins): also include primitive.name as the operator type.
   return loc
 
+upstream_dialects = ir.DialectRegistry()
+if register_jax_dialects:
+  register_jax_dialects.register_dialects(upstream_dialects)
 
 # Translation rules
 def make_ir_context() -> ir.Context:
   """Creates an MLIR context suitable for JAX IR."""
   context = ir.Context()
+  context.append_dialect_registry(upstream_dialects)
+  context.load_all_available_dialects()
 
   # If threading is enabled, each MLIR context will keep alive a thread pool.
   # Since we cache MLIR modules (and hence contexts), this means we might keep
@@ -700,7 +707,7 @@ def _to_xla_layout(layout: XLACompatibleLayout | None | LayoutRequest) -> str | 
   return layout._to_xla_layout()
 
 
-def _get_mem_kind(s: Optional[XLACompatibleSharding]) -> Optional[str]:
+def _get_mem_kind(s: XLACompatibleSharding | None) -> str | None:
   if s is None:
     return None
   assert isinstance(s, sharding_impls.XLACompatibleSharding)
@@ -750,6 +757,7 @@ def lower_jaxpr_to_module(
     result_memory_kinds = (map(_get_mem_kind, result_shardings)
                           if result_shardings is not None else None)
 
+  xla_donated_args = None
   platforms_with_donation = [p for p in platforms
                              if p in _platforms_with_donation]
   if platforms_with_donation:
@@ -758,12 +766,17 @@ def lower_jaxpr_to_module(
         "In multi-platform lowering either all or no lowering platforms "
         f"should support donation. Lowering for {platforms} of which "
         f"only {platforms_with_donation} support donation")
-    input_output_aliases, donated_args = _set_up_aliases(
-        in_avals, out_avals, donated_args, arg_memory_kinds, result_memory_kinds)
+    if num_partitions > 1 and xla_extension_version >= 220 and (
+        result_shardings is None or all(s is None for s in result_shardings)):
+      xla_donated_args = donated_args
+    if xla_donated_args is None:
+      input_output_aliases, donated_args = _set_up_aliases(
+        in_avals, out_avals, donated_args, arg_memory_kinds,
+        result_memory_kinds)
   unlowerable_effects = lowerable_effects.filter_not_in(jaxpr.effects)
   if unlowerable_effects:
     raise ValueError(f'Cannot lower jaxpr with effects: {jaxpr.effects}')
-  if any(donated_args):
+  if xla_donated_args is None and any(donated_args):
     unused_donations = [str(a) for a, d in zip(in_avals, donated_args) if d]
     msg = "See an explanation at https://jax.readthedocs.io/en/latest/faq.html#buffer-donation."
     if not platforms_with_donation:
@@ -771,6 +784,14 @@ def lower_jaxpr_to_module(
     if unused_donations:
       warnings.warn("Some donated buffers were not usable:"
                     f" {', '.join(unused_donations)}.\n{msg}")
+
+  if xla_donated_args is not None:
+    assert input_output_aliases is None
+  if input_output_aliases is not None:
+    assert xla_donated_args is None
+
+  # Delete donated_args by default here, since it's not needed beyond this point
+  del donated_args
 
   # HLO channels need to start at 1
   channel_iter = itertools.count(1)
@@ -808,8 +829,7 @@ def lower_jaxpr_to_module(
                       host_callbacks=host_callbacks,
                       lowering_parameters=lowering_parameters,
                       shape_poly_state=ShapePolyLoweringState(
-                        dim_vars,
-                        lowering_parameters.platforms))
+                          dim_vars, lowering_parameters.platforms))
   with ctx.context, ir.Location.unknown(ctx.context):
     # Remove module name characters that XLA would alter. This ensures that
     # XLA computation preserves the module name.
@@ -828,6 +848,7 @@ def lower_jaxpr_to_module(
         arg_shardings=arg_op_shardings,
         result_shardings=result_op_shardings,
         input_output_aliases=input_output_aliases,
+        xla_donated_args=xla_donated_args,
         arg_names=arg_names,
         result_names=result_names,
         arg_memory_kinds=arg_memory_kinds,
@@ -981,6 +1002,7 @@ def lower_jaxpr_to_fun(
     result_shardings: Sequence[xc.HloSharding | None] | None = None,
     use_sharding_annotations: bool = True,
     input_output_aliases: Sequence[int | None] | None = None,
+    xla_donated_args: Sequence[bool] | None = None,
     num_output_tokens: int = 0,
     api_name: str = "jit",
     arg_names: Sequence[str | None] | None = None,
@@ -1016,6 +1038,7 @@ def lower_jaxpr_to_fun(
       propagated on non-entry functions during MLIR->HLO conversion.
     input_output_aliases: optional sequence that maps argument numbers to the
       corresponding output that should alias them.
+    xla_donated_args: optional sequence of args to set donation annotations.
     api_name: The name of the higher level primitive which should show up in the
       name stack.
   Returns:
@@ -1081,6 +1104,8 @@ def lower_jaxpr_to_fun(
   if result_layouts is not None:
     token_layouts = [None] * (num_tokens + num_output_tokens)
     result_layouts = [*token_layouts, *result_layouts]
+  if xla_donated_args is not None:
+    xla_donated_args = [*([False] * (num_dim_vars + num_tokens)), *xla_donated_args]
 
   flat_input_types = util.flatten(input_types)
   flat_output_types = util.flatten(output_types)
@@ -1108,6 +1133,11 @@ def lower_jaxpr_to_fun(
     ir_arg_layouts = util.flatten(
         [[l] * len(types) for l, types in zip(arg_layouts, input_types)])
 
+  ir_donated_args = None
+  if xla_donated_args is not None:
+    ir_donated_args = util.flatten(
+        [[is_donated] * len(types) for is_donated, types in zip(xla_donated_args, input_types)])
+
   ir_result_shardings = None
   if result_shardings is not None:
     out_avals = [None] * (num_tokens + num_output_tokens) + list(jaxpr.out_avals)
@@ -1131,6 +1161,7 @@ def lower_jaxpr_to_fun(
       or ir_arg_shardings is not None
       or ir_arg_layouts is not None
       or input_output_aliases is not None
+      or ir_donated_args is not None
       or arg_names is not None
       or num_tokens > 0
       or num_dim_vars > 0
@@ -1154,6 +1185,11 @@ def lower_jaxpr_to_fun(
       for attrs, layout in zip(arg_attrs, ir_arg_layouts):
         if layout is not None:
           attrs["mhlo.layout_mode"] = ir.StringAttr.get(layout)
+
+    if ir_donated_args is not None:
+      for attrs, is_donated in zip(arg_attrs, ir_donated_args):
+        if is_donated:
+          attrs["jax.buffer_donor"] = ir.BoolAttr.get(True)
 
     if input_output_aliases is not None:
       output_ids = util.unflatten(list(range(len(flat_output_types))),
@@ -1417,7 +1453,7 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
     with source_info_util.user_context(eqn.source_info.traceback), loc:
       override_rule = get_override_lowering_rule(eqn.primitive)
       platform_rules: dict[str, LoweringRule] = {}
-      default_rule: Optional[LoweringRule] = None
+      default_rule: LoweringRule | None = None
       # See mlir.lower_per_platform for meaning of `platform_rules` and `default_rule`
       if override_rule is not None:
         default_rule = override_rule
@@ -1485,11 +1521,10 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
   return map(read, jaxpr.outvars), tokens
 
 
-
 def lower_per_platform(ctx: LoweringRuleContext,
                        description: str,
                        platform_rules: dict[str, LoweringRule],
-                       default_rule: Optional[LoweringRule],
+                       default_rule: LoweringRule | None,
                        effects: effects_lib.Effects,
                        *rule_args: ir.Value,
                        **rule_kwargs) -> ir.Value:
@@ -1674,7 +1709,7 @@ def _lower_jaxpr_to_fun_cached(ctx, fn_name, call_jaxpr, effects,
   return func_op
 
 
-def check_backend_matches(inner_backend: Optional[str],
+def check_backend_matches(inner_backend: str | None,
                           lowering_platforms: Sequence[str]):
   # For nested calls, the outermost call sets the backend for all inner calls;
   # it's an error if the inner call has a conflicting explicit backend spec.

@@ -37,6 +37,7 @@ from jax._src.sharding_impls import SingleDeviceSharding
 # `pure_callback_p` is the main primitive for staging out Python pure callbacks.
 pure_callback_p = core.Primitive("pure_callback")
 pure_callback_p.multiple_results = True
+dispatch.prim_requires_devices_during_lowering.add(pure_callback_p)
 
 map, unsafe_map = util.safe_map, map
 
@@ -156,14 +157,17 @@ def _callback_op_sharding(axis_context, sharding: SingleDeviceSharding | None):
             f" {type(sharding)}"
         )
       device = next(iter(sharding.device_set))
+      device_assignment = axis_context.device_assignment
+      if device_assignment is None:
+        raise AssertionError(
+            "Please file a bug at https://github.com/google/jax/issues")
       try:
-        device_index = axis_context.device_assignment.index(device)
+        device_index = device_assignment.index(device)
       except IndexError as e:
         raise ValueError(
             "Sharding provided to pure_callback specifies a device"
             f" {device} that is not in the device assignment"
-            f" ({axis_context.device_assignment})"
-        ) from e
+            f" ({device_assignment})") from e
     else:
       device_index = 0
 
@@ -345,6 +349,7 @@ def pure_callback_api(
 
 io_callback_p = core.Primitive("io_callback")
 io_callback_p.multiple_results = True
+dispatch.prim_requires_devices_during_lowering.add(io_callback_p)
 
 class IOEffect(effects.Effect):
   __str__ = lambda _: "IO"

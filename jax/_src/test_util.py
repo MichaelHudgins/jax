@@ -24,7 +24,7 @@ import re
 import os
 import tempfile
 import textwrap
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 import unittest
 import warnings
 import zlib
@@ -337,9 +337,17 @@ def pjrt_c_api_version_at_least(major_version: int, minor_version: int):
     return True
   return pjrt_c_api_versions >= (major_version, minor_version)
 
-
-def is_device_tpu_v4():
-  return jax.devices()[0].device_kind == "TPU v4"
+def is_device_tpu(version: int | None = None, variant: str = "") -> bool:
+  if device_under_test() != "tpu":
+    return False
+  if version is None:
+    return True
+  device_kind = jax.devices()[0].device_kind
+  expected_version = f"v{version}{variant}"
+  # Special case v5e until the name is updated in device_kind
+  if expected_version == "v5e":
+    return "v5 lite" in device_kind
+  return expected_version in device_kind
 
 def _get_device_tags():
   """returns a set of tags defined for the device under test"""
@@ -911,7 +919,7 @@ class JaxTestCase(parameterized.TestCase):
     'jax_legacy_prng_key': 'error',
   }
 
-  _compilation_cache_exit_stack: Optional[ExitStack] = None
+  _compilation_cache_exit_stack: ExitStack | None = None
 
   # TODO(mattjj): this obscures the error messages from failures, figure out how
   # to re-enable it
@@ -1112,17 +1120,11 @@ JIT_IMPLEMENTATION = (
 )
 
 class BufferDonationTestCase(JaxTestCase):
-  assertDeleted = lambda self, x: self._assertDeleted(x, True)
-  assertNotDeleted = lambda self, x: self._assertDeleted(x, False)
+  def assertDeleted(self, x):
+    self.assertTrue(x.is_deleted())
 
-  def _assertDeleted(self, x, deleted):
-    if hasattr(x, "_arrays"):
-      self.assertEqual(x.is_deleted(), deleted)
-    elif hasattr(x, "device_buffer"):
-      self.assertEqual(x.device_buffer.is_deleted(), deleted)
-    else:
-      for buffer in x.device_buffers:
-        self.assertEqual(buffer.is_deleted(), deleted)
+  def assertNotDeleted(self, x):
+    self.assertFalse(x.is_deleted())
 
 
 @contextmanager
@@ -1273,8 +1275,8 @@ def numpy_version():
 
 def parameterized_filterable(*,
     kwargs: Sequence[dict[str, Any]],
-    testcase_name: Optional[Callable[[dict[str, Any]], str]] = None,
-    one_containing: Optional[str] = None,
+    testcase_name: Callable[[dict[str, Any]], str] | None = None,
+    one_containing: str | None = None,
 ):
   """
   Decorator for named parameterized tests, with filtering.

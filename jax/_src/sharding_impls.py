@@ -22,7 +22,7 @@ import enum
 import functools
 import itertools
 import math
-from typing import Any, NamedTuple, Union, cast, Optional
+from typing import Any, NamedTuple, Union, cast
 
 from jax._src import mesh as mesh_lib
 from jax._src.op_shardings import (
@@ -566,9 +566,9 @@ class PmapSharding(XLACompatibleSharding):
 
 
 def _op_sharding_to_pos_sharding(
-    op_sharding: Union[xc.OpSharding, xc.HloSharding],
+    op_sharding: xc.OpSharding | xc.HloSharding,
     device_assignment: Sequence[xc.Device],
-    memory_kind: Optional[str] = None) -> PositionalSharding:
+    memory_kind: str | None = None) -> PositionalSharding:
   if isinstance(op_sharding, xc.OpSharding):
     op_sharding = xc.HloSharding.from_proto(op_sharding)  # type: ignore
 
@@ -1173,7 +1173,13 @@ class ShardingContext:
 
   This context also uses the GSPMD partitioner.
   """
-  device_assignment: Sequence[xc.Device]
+  num_devices: int
+  device_assignment: tuple[xc.Device] | None = None
+
+  def __post_init__(self):
+    if self.device_assignment is not None:
+      assert isinstance(self.device_assignment, tuple)
+      assert self.num_devices == len(self.device_assignment)
 
   # Similar to SPMDContext as ShardingContext also uses the GSPMD partitioner.
   @property

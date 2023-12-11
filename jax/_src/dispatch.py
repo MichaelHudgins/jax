@@ -191,6 +191,7 @@ def should_tuple_args(num_args: int, platform: str) -> bool:
   else:
     return False
 
+@util.weakref_lru_cache
 def jaxpr_has_primitive(jaxpr: core.Jaxpr, prim_name: str) -> bool:
   """Whether there is a primitive given by user anywhere inside a Jaxpr."""
   for eqn in jaxpr.eqns:
@@ -198,6 +199,21 @@ def jaxpr_has_primitive(jaxpr: core.Jaxpr, prim_name: str) -> bool:
       return True
   for subjaxpr in core.subjaxprs(jaxpr):
     if jaxpr_has_primitive(subjaxpr, prim_name):
+      return True
+  return False
+
+
+# Use this registry with caution. It will void the guarantee that lowering to
+# stablehlo is oblivious of physical devices.
+prim_requires_devices_during_lowering: set[core.Primitive] = set()
+
+@util.weakref_lru_cache
+def jaxpr_has_prim_requiring_devices(jaxpr: core.Jaxpr):
+  for eqn in jaxpr.eqns:
+    if eqn.primitive in prim_requires_devices_during_lowering:
+      return True
+  for subjaxpr in core.subjaxprs(jaxpr):
+    if jaxpr_has_prim_requiring_devices(subjaxpr):
       return True
   return False
 

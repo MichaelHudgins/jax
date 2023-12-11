@@ -21,7 +21,7 @@ import functools
 from functools import partial
 import operator as op
 import textwrap
-from typing import Any, Callable, NamedTuple, Type, TypeVar, Union, overload
+from typing import Any, Callable, NamedTuple, TypeVar, Union, overload
 
 from jax._src import traceback_util
 from jax._src.lib import pytree
@@ -337,9 +337,13 @@ register_pytree_node(
   lambda x: (tuple(x.values()), tuple(x.keys())),
   lambda keys, values: collections.OrderedDict(safe_zip(keys, values)))
 
+def _flatten_defaultdict(d):
+  keys = tuple(sorted(d))
+  return tuple(d[k] for k in keys), (d.default_factory, keys)
+
 register_pytree_node(
   collections.defaultdict,
-  lambda x: (tuple(x.values()), (x.default_factory, tuple(x.keys()))),
+  _flatten_defaultdict,
   lambda s, values: collections.defaultdict(s[0], safe_zip(s[1], values)))  # type: ignore[index,call-overload]
 
 
@@ -737,7 +741,7 @@ def register_pytree_with_keys_class(cls: U) -> U:
   return cls
 
 
-def register_static(cls: Type[H]) -> Type[H]:
+def register_static(cls: type[H]) -> type[H]:
   """Registers `cls` as a pytree with no leaves.
 
   Instances are treated as static by `jax.jit`, `jax.pmap`, etc. This can be an

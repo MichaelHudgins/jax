@@ -1400,12 +1400,12 @@ def _pjit_cached_lower_jaxpr_to_fun(ctx, name, jaxpr, effects, in_shardings,
                                     out_shardings, api_name):
   mod_ctx = ctx.module_context
   axis_ctx = ctx.module_context.axis_context
-  da = None
+  num_devices = None
   if isinstance(axis_ctx, sharding_impls.ShardingContext):
-    da = tuple(axis_ctx.device_assignment)
+    num_devices = axis_ctx.num_devices
   elif isinstance(axis_ctx, sharding_impls.SPMDAxisContext):
-    da = axis_ctx.mesh._flat_devices_tuple
-  key = (pjit_p, name, jaxpr, effects, da,
+    num_devices = axis_ctx.mesh.size
+  key = (pjit_p, name, jaxpr, effects, num_devices,
          pxla.SemanticallyEqualShardings(in_shardings),
          pxla.SemanticallyEqualShardings(out_shardings), api_name)
 
@@ -1864,7 +1864,11 @@ def _pjit_pp_rule(eqn, context, settings):
   if (params['resource_env'] is None or
       params['resource_env'].physical_mesh.empty):
     del params['resource_env']
-  return core._pp_eqn(eqn.replace(params=params), context, settings)
+
+  # Move name= to the front to make the resulting equation easier to scan.
+  del params["name"]
+  return core._pp_eqn(eqn, context, settings, params=["name"] + sorted(params))
+
 core.pp_eqn_rules[pjit_p] = _pjit_pp_rule
 
 
