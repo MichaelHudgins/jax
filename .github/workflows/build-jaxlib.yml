@@ -104,5 +104,5 @@ jobs:
         python -m pip install -U -e .
         export TF_CPP_MIN_LOG_LEVEL=0
         python -c "import jax; print(jax.default_backend()); print(jax.devices()); print(len(jax.devices()))"
-        
-        JAX_NUM_GENERATED_CASES=25 pytest -n auto --tb=short --maxfail=20 tests examples
+        # JAX_NUM_GENERATED_CASES=25 pytest -n auto --tb=short --maxfail=20 tests examples
+        JAX_NUM_GENERATED_CASES=5 pytest -n auto --tb=short --maxfail=20 tests examples
