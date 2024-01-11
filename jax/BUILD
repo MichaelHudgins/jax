@@ -137,12 +137,13 @@ py_library(
 py_library(
     name = "internal_test_util",
     testonly = 1,
-    srcs = glob(
-        ["_src/internal_test_util/**/*.py"],  # include
+    srcs = [
+        "_src/internal_test_util/deprecation_module.py",
+        "_src/internal_test_util/lax_test_util.py",
+    ] + glob(
         [
-            "_src/internal_test_util/test_harnesses.py",
-            "_src/internal_test_util/export_back_compat_test_util.py",
-        ],  # exclude
+            "_src/internal_test_util/lazy_loader_module/*.py",
+        ],
     ),
     visibility = [":internal"],
     deps = [
@@ -173,6 +174,16 @@ py_library(
     ] + py_deps("numpy"),
 )
 
+py_library(
+    name = "internal_export_back_compat_test_data",
+    testonly = 1,
+    srcs = glob(["_src/internal_test_util/export_back_compat_test_data/*.py"]),
+    visibility = [
+        ":internal",
+    ],
+    deps = py_deps("numpy"),
+)
+
 py_library_providing_imports_info(
     name = "jax",
     srcs = [
@@ -198,6 +209,7 @@ py_library_providing_imports_info(
         "_src/prng.py",
         "_src/public_test_util.py",
         "_src/random.py",
+        "_src/shard_alike.py",
         "_src/stages.py",
     ] + glob(
         [
@@ -212,6 +224,7 @@ py_library_providing_imports_info(
             "_src/scipy/**/*.py",
             "_src/state/**/*.py",
             "_src/third_party/**/*.py",
+            "experimental/key_reuse/**/*.py",
             "image/**/*.py",
             "interpreters/**/*.py",
             "lax/**/*.py",
@@ -352,6 +365,7 @@ pytype_strict_library(
         ":compilation_cache_interface",
         ":config",
         ":gfile_cache",
+        ":monitoring",
         ":path",
         "//jax/_src/lib",
     ] + py_deps("numpy") + py_deps("zstandard"),
@@ -393,8 +407,8 @@ pytype_strict_library(
     deps = [
         ":compilation_cache_internal",
         ":config",
+        ":mlir",
         ":monitoring",
-        ":path",
         ":profiler",
         ":traceback_util",
         "//jax/_src/lib",
@@ -518,6 +532,7 @@ pytype_strict_library(
         ":layout",
         ":op_shardings",
         ":partial_eval",
+        ":path",
         ":pickle_util",
         ":sharding_impls",
         ":source_info_util",
@@ -684,7 +699,6 @@ pytype_strict_library(
 pytype_strict_library(
     name = "sharding_impls",
     srcs = ["_src/sharding_impls.py"],
-    visibility = [":internal"] + jax_visibility("sharding_impls"),
     deps = [
         ":config",
         ":mesh",
@@ -724,15 +738,17 @@ pytype_strict_library(
     name = "state_types",
     srcs = [
         "_src/state/__init__.py",
+        "_src/state/indexing.py",
         "_src/state/types.py",
     ],
     deps = [
         ":core",
         ":effects",
         ":pretty_printer",
+        ":tree_util",
         ":typing",
         ":util",
-    ],
+    ] + py_deps("numpy"),
 )
 
 pytype_strict_library(
@@ -777,8 +793,6 @@ pytype_strict_library(
         "//jax/_src/lib",
     ] + if_building_jaxlib([
         "//jaxlib/mlir:ir",
-        "//jaxlib/mlir:mhlo_dialect",
-        "//jaxlib/mlir:pass_manager",
         "//jaxlib/mlir:stablehlo_dialect",
     ]) + py_deps("numpy") + py_deps("absl/flags"),
 )

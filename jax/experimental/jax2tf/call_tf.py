@@ -22,7 +22,11 @@ For examples and details, see
 https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#calling-tensorflow-functions-from-jax.
 
 """
+
+from __future__ import annotations
+
 from collections.abc import Sequence
+import dataclasses
 import functools
 from typing import Any, Callable, Optional
 
@@ -32,20 +36,16 @@ from jax import dlpack
 from jax import dtypes
 from jax import numpy as jnp
 from jax import tree_util
-from jax._src import ad_checkpoint
 from jax._src import ad_util
 from jax._src import core
-from jax._src import custom_derivatives
 from jax._src import effects
 from jax._src import util
-from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func as func_dialect
 from jax._src.lib.mlir.dialects import hlo
 from jax.experimental.jax2tf import jax2tf as jax2tf_internal
 from jax.interpreters import mlir
-from jax.interpreters import xla
 import numpy as np
 import tensorflow as tf
 
@@ -271,7 +271,7 @@ def call_tf(
   return util.wraps(callable_tf)(make_call)
 
 
-def check_tf_result(idx: int, r_tf: TfVal, r_aval: Optional[core.ShapedArray]) -> TfVal:
+def check_tf_result(idx: int, r_tf: TfVal, r_aval: core.ShapedArray | None) -> TfVal:
   # Check that the TF function returns values of expected types. This
   # improves error reporting, preventing hard-to-diagnose errors downstream
   try:
@@ -338,6 +338,9 @@ def _call_tf_impl(*args_jax_flat, callable_flat_tf, **_):
     # The following avoids copies to the host on CPU, always for Array
     # and even for ndarray if they are sufficiently aligned.
     # TODO(necula): on TPU this copies to the host!
+    if getattr(arg_jax, 'dtype', None) == dtypes.float0:
+      return tf.zeros(shape=arg_jax.shape,
+                      dtype=jax2tf_internal._tf_np_dtype_for_float0)
     return tf.constant(np.asarray(arg_jax))
 
   args_tf_flat = tuple(map(_arg_jax_to_tf, args_jax_flat))
@@ -373,6 +376,7 @@ def _get_concrete_function_tf(function_flat_tf, args_flat_sig_tf):  # -> tf.Conc
 
 
 # Mark the effectful instances of call_tf
+@dataclasses.dataclass(frozen=True)
 class CallTfEffect(effects.Effect):
   __str__ = lambda _: "CallTfEffect"
 

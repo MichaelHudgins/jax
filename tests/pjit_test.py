@@ -45,7 +45,7 @@ from jax.experimental.maps import xmap
 from jax.experimental import multihost_utils
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax._src import array
-from jax._src.sharding import Sharding, _addressable_devices_indices_map
+from jax._src.sharding import Sharding
 from jax._src import op_shardings
 from jax._src import sharding_impls
 from jax._src.sharding_impls import (
@@ -60,7 +60,7 @@ from jax._src import xla_bridge
 from jax._src.lib import xla_client as xc
 from jax._src.lib import xla_extension
 from jax._src.lib import xla_extension_version
-from jax._src.util import curry, unzip2, safe_zip
+from jax._src.util import curry, unzip2
 
 config.parse_flags_with_absl()
 
@@ -486,30 +486,6 @@ class PJitTest(jtu.BufferDonationTestCase):
     # Annotation from pjit
     self.assertIn('sharding = "{replicated}"', str(hlo))
 
-  @jtu.with_mesh([('x', 2), ('y', 1)])
-  def testShardingConstraint(self):
-    @partial(pjit, in_shardings=None, out_shardings=None)
-    def f(x):
-      y = x + 1
-      y = with_sharding_constraint(y, P('x', 'y'))
-      return y * 2
-
-    shape = (8, 8)
-    x = np.arange(math.prod(shape)).reshape(shape)
-    expected = (x + 1) * 2
-    actual = f(x)
-    self.assertAllClose(actual, expected, check_dtypes=False)
-    _check_instance(self, actual)
-    self.assertLen(actual.addressable_shards, 2)
-    self.assertAllClose(np.asarray(actual.addressable_shards[0].data), expected,
-                        check_dtypes=False)
-
-    hlo = f.lower(np.ones(shape)).compiler_ir(dialect="hlo")
-    # Annotation from with_sharding_constraint
-    self.assertIn('sharding={devices=[2,1]<=[2]}', hlo.as_hlo_text())
-    # Annotation from pjit
-    self.assertIn("sharding={replicated}", hlo.as_hlo_text())
-
   def testShardingConstraintWithArray(self):
     mesh = jtu.create_global_mesh((2, 1), ('x', 'y'))
     s = NamedSharding(mesh, P(None))
@@ -562,60 +538,27 @@ class PJitTest(jtu.BufferDonationTestCase):
     # Annotation from pjit
     self.assertIn("sharding={replicated}", hlo.as_hlo_text())
 
-  @jtu.with_mesh([('x', 2), ('y', 1)])
-  def testShardingConstraintPyTree(self):
-    @partial(pjit, in_shardings=None, out_shardings=None)
-    def f(x):
-      x = jax.lax.with_sharding_constraint(x, [P('x', 'y'), P('y', 'x')])
-      x = x.copy()
-      x[0]["a"] *= 2
-      return x
-
-    shape = (8, 8)
-    v = np.arange(math.prod(shape)).reshape(shape)
-    x = [{"a": v, "b": v * 2}, v * 3]
-    actual = f(x)
-
-    expected = x.copy()
-    expected[0]["a"] *= 2
-    self.assertAllClose(actual, expected, check_dtypes=False)
-    self.assertLen(actual[0]["a"].addressable_shards, 2)
-
-    hlo = f.lower(x).compiler_ir(dialect="hlo")
-    # Annotations from with_sharding_constraint
-    self.assertIn('sharding={devices=[2,1]<=[2]}', hlo.as_hlo_text())
-    self.assertIn('sharding={devices=[2,1]<=[2]}', hlo.as_hlo_text())
-    # Annotation from pjit
-    self.assertIn("sharding={replicated}", hlo.as_hlo_text())
-
   def testShardingConstraintPyTreeWithArray(self):
     mesh = jtu.create_global_mesh((2, 1), ('x', 'y'))
-    s = NamedSharding(mesh, P(None))
 
-    @partial(pjit, in_shardings=s, out_shardings=s)
+    @jax.jit
     def f(x):
-      x = with_sharding_constraint(x, [
-          NamedSharding(mesh, P('x', 'y')),
-          NamedSharding(mesh, P('y', 'x'))
-      ])
-      x = x.copy()
-      x[0]["a"] *= 2
-      return x
+      return with_sharding_constraint(x, NamedSharding(mesh, P('x', 'y')))
 
     shape = (8, 8)
     v = np.arange(math.prod(shape)).reshape(shape)
-    x = [{"a": v, "b": v * 2}, v * 3]
-    actual = f(x)
+    x = [v, v * 2]
+    out = f(x)
 
-    expected = x.copy()
-    expected[0]["a"] *= 2
-    self.assertAllClose(actual, expected, check_dtypes=False)
-    self.assertLen(actual[0]["a"].addressable_shards, 2)
+    self.assertArraysEqual(out[0], v)
+    self.assertArraysEqual(out[1], v * 2)
+    self.assertLen(out[0].addressable_shards, 2)
+    self.assertLen(out[1].addressable_shards, 2)
 
     hlo = f.lower(x).compiler_ir(dialect="hlo")
     # Annotations from with_sharding_constraint
     self.assertIn('sharding={devices=[2,1]<=[2]}', hlo.as_hlo_text())
-    self.assertIn('sharding={devices=[1,2]<=[2]}', hlo.as_hlo_text())
+    self.assertIn('sharding={devices=[2,1]<=[2]}', hlo.as_hlo_text())
     # Annotation from pjit
     self.assertIn("sharding={replicated}", hlo.as_hlo_text())
 
@@ -1295,16 +1238,86 @@ class PJitTest(jtu.BufferDonationTestCase):
         pjit_f(jnp.array([1, 2, 3]))
 
   def test_pretty_print(self):
-    f = pjit(lambda x: x)
+    f = pjit(lambda x: x**2)
+    g = pjit(lambda x: f(x) + f(x))
     x = jnp.array([4.2], dtype=jnp.float32)
-    jaxpr = jax.make_jaxpr(f)(x)
+    jaxpr = jax.make_jaxpr(g)(x)
     self.assertEqual(
         jaxpr.pretty_print(),
         textwrap.dedent("""
-            { lambda ; a:f32[1]. let
-                b:f32[1] = pjit[name=<lambda> jaxpr={ lambda ; c:f32[1]. let  in (c,) }] a
-              in (b,) }
+            let lambda = { lambda ; a:f32[1]. let b:f32[1] = integer_pow[y=2] a in (b,) } in
+            { lambda ; c:f32[1]. let
+                d:f32[1] = pjit[
+                  name=<lambda>
+                  jaxpr={ lambda ; e:f32[1]. let
+                      f:f32[1] = pjit[name=<lambda> jaxpr=lambda] e
+                      g:f32[1] = pjit[name=<lambda> jaxpr=lambda] e
+                      h:f32[1] = add f g
+                    in (h,) }
+                ] c
+              in (d,) }
         """).strip(),
+    )
+
+  def test_pretty_print_with_closure(self):
+    @pjit
+    def g(x, y):
+      @pjit
+      def f(x):
+        return x * y
+      return f(x) + f(y)
+
+    x = jnp.array([4.2], dtype=jnp.float32)
+    jaxpr = jax.make_jaxpr(g)(x, x)
+    self.assertEqual(
+        jaxpr.pretty_print(),
+        textwrap.dedent("""
+            let f = { lambda ; a:f32[1] b:f32[1]. let c:f32[1] = mul b a in (c,) } in
+            { lambda ; d:f32[1] e:f32[1]. let
+                g:f32[1] = pjit[
+                  name=g
+                  jaxpr={ lambda ; h:f32[1] i:f32[1]. let
+                      j:f32[1] = pjit[name=f jaxpr=f] i h
+                      k:f32[1] = pjit[name=f jaxpr=f] i i
+                      l:f32[1] = add j k
+                    in (l,) }
+                ] d e
+              in (g,) }
+        """).strip(),
+    )
+
+  def test_pretty_print_with_name_clash(self):
+    @pjit
+    def g(x, y):
+      @pjit
+      def f(x):
+        return x
+
+      return f(x)*f(x) + f(y)*f(y)
+
+    x = jnp.array([4.2], dtype=jnp.float32)
+    y = jnp.array([4.2, 2.4], dtype=jnp.float32)
+    jaxpr = jax.make_jaxpr(g)(x, y)
+    self.assertEqual(
+        jaxpr.pretty_print(),
+        textwrap.dedent("""
+            let f = { lambda ; a:f32[1]. let  in (a,) } in
+            let f1 = { lambda ; b:f32[2]. let  in (b,) } in
+            { lambda ; c:f32[1] d:f32[2]. let
+                e:f32[2] = pjit[
+                  name=g
+                  jaxpr={ lambda ; g:f32[1] h:f32[2]. let
+                      i:f32[1] = pjit[name=f jaxpr=f] g
+                      j:f32[1] = pjit[name=f jaxpr=f] g
+                      k:f32[1] = mul i j
+                      l:f32[2] = pjit[name=f jaxpr=f1] h
+                      m:f32[2] = pjit[name=f jaxpr=f1] h
+                      n:f32[2] = mul l m
+                      o:f32[2] = add k n
+                    in (o,) }
+                ] c d
+              in (e,) }
+            """).strip(),
     )
 
 
@@ -2237,8 +2250,9 @@ class ArrayPjitTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(
         ValueError,
         "Received incompatible devices for pjitted computation. Got argument "
-        r"x of.*\<lambda\> with shape int.*\[3\] and device ids \[0\].*and "
-        r"argument  of.*\<lambda\> with shape int.*\[3\] and device ids \[1\].*"):
+        r"x\[0\] of.*\<lambda\> with shape int.*\[3\] and device ids \[0\].*and "
+        r"argument x\[1\] of.*\<lambda\> with shape int.*\[3\] and device ids "
+        r"\[1\].*"):
       pjit(lambda *x: x)(a, b)
 
   def test_pjit_pytree_inp_device_assignment_mismatch(self):
@@ -3532,32 +3546,6 @@ class ArrayPjitTest(jtu.JaxTestCase):
     self.assertIsInstance(out4.sharding, SingleDeviceSharding)
     self.assertEqual(out4.devices(), {jax.devices()[1]})
 
-  def test_get_indices_cache(self):
-    mesh = jtu.create_global_mesh((2, 2), ('x', 'y'))
-    ns = NamedSharding(mesh, P('x'))
-    ns2 = NamedSharding(mesh, P('x', 'y'))
-
-    np_inp = np.arange(16).reshape(8, 2)
-    arr1 = jax.device_put(np_inp, ns)
-    arr2 = jax.device_put(np_inp, ns2)
-    arr3 = jax.device_put(np_inp, ns)
-
-    _addressable_devices_indices_map.cache_clear()
-
-    cache_info1 = _addressable_devices_indices_map.cache_info()
-    out = pjit(lambda x, y, z: x + y + z)(arr1, arr2, arr3)
-    cache_info2 = _addressable_devices_indices_map.cache_info()
-    self.assertArraysEqual(out, np_inp * 3)
-
-    # arr3 and arr1 should have the same GSPMDSharding objects internally.
-    # So there will be 2 hits in _addressable_devices_indices_map,
-    # One in `pxla._get_input_indices` and second in `_array_shard_arg`.
-    self.assertEqual(cache_info2.hits, cache_info1.hits + 2)
-    # There will double the amount of misses as hits because arr1 and arr2's
-    # sharding are not the same. So 2 misses in _addressable_devices_indices_map
-    # and 2 in _array_shard_arg.
-    self.assertEqual(cache_info2.misses, cache_info1.misses + 4)
-
   def test_same_named_sharding_pspec_on_eager_ops(self):
     mesh = jtu.create_global_mesh((1, 8, 1), ('x', 'y', 'z'))
     sharding = jax.sharding.NamedSharding(mesh, P('x', 'y', 'z'))
@@ -4193,6 +4181,17 @@ class PJitErrorTest(jtu.JaxTestCase):
         r"sharding.*the computation was compiled with"):
       g(x, y2)
 
+  def test_dce_no_array(self):
+    mesh = jtu.create_global_mesh((2,), ('x',))
+    arr = jax.device_put(np.arange(8.), NamedSharding(mesh, P('x')))
+
+    @jax.jit
+    def f(a, b, c):
+      return a, c
+
+    f(arr, 2., 3.)
+    f(arr, 2., 3.)  # doesn't crash
+
 
 @jtu.pytest_mark_if_available('multiaccelerator')
 class UtilTest(jtu.JaxTestCase):
@@ -4235,37 +4234,6 @@ class UtilTest(jtu.JaxTestCase):
     self.assertEqual(
         sharding_impls.array_mapping_to_axis_resources(inp), expected_out
     )
-
-  def test_get_input_indices_fully_replicated(self):
-    global_mesh = jtu.create_global_mesh((2, 2), ('x', 'y'))
-    global_in_aval1 = core.ShapedArray((4, 4), jnp.int32)
-    global_in_aval2 = core.ShapedArray((4, 4, 4), jnp.int32)
-    global_in_aval3 = core.ShapedArray((), jnp.int32)
-    in_avals = [global_in_aval1, global_in_aval2, global_in_aval3]
-
-    mp = NamedSharding(global_mesh, P(None))
-
-    out_indices = pxla._get_input_indices(in_avals, [mp, mp, mp],
-                                          list(global_mesh.devices.flat))
-
-    self.assertLen(out_indices, len(in_avals))
-    self.assertTrue(all(len(out) == len(global_mesh.local_devices)
-                    for out in out_indices))
-    self.assertTrue(all(len(i) == aval.ndim
-                    for out, aval in safe_zip(out_indices, in_avals) for i in out))
-    self.assertTrue(all(i == (slice(None),) * aval.ndim
-                    for out, aval in safe_zip(out_indices, in_avals) for i in out))
-
-  def test_mesh_sharding_spec(self):
-    mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
-    array_mapping = pxla.get_array_mapping(P('x', 'y'))
-    aval = core.ShapedArray((1, 1), jnp.int32)
-    with self.assertRaisesRegex(
-        ValueError,
-        'The aval shape on dimension 0 is 1 and the size of axis x is 4. The '
-        'aval shape % axis size should be zero but got 1'
-    ):
-      pxla.mesh_sharding_specs(mesh.shape, mesh.axis_names)(aval, array_mapping)
 
   @parameterized.named_parameters(
       ("all_unspecified", (UNSPECIFIED, UNSPECIFIED), AssertionError),

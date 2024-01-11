@@ -32,7 +32,8 @@ from functools import partial
 import math
 import operator
 import types
-from typing import (overload, Any, Callable, Literal, NamedTuple, Protocol, TypeVar, Union)
+from typing import (overload, Any, Callable, Literal, NamedTuple, Protocol,
+                    TypeVar, Union)
 from textwrap import dedent as _dedent
 import warnings
 
@@ -324,23 +325,6 @@ def result_type(*args: Any) -> DType:
   return dtypes.result_type(*args)
 
 
-@util._wraps(np.trapz)
-@partial(jit, static_argnames=('axis',))
-def trapz(y: ArrayLike, x: ArrayLike | None = None, dx: ArrayLike = 1.0, axis: int = -1) -> Array:
-  if x is None:
-    util.check_arraylike('trapz', y)
-    y_arr, = util.promote_dtypes_inexact(y)
-  else:
-    util.check_arraylike('trapz', y, x)
-    y_arr, x_arr = util.promote_dtypes_inexact(y, x)
-    if x_arr.ndim == 1:
-      dx = diff(x_arr)
-    else:
-      dx = moveaxis(diff(x_arr, axis=axis), axis, -1)
-  y_arr = moveaxis(y_arr, axis, -1)
-  return 0.5 * (dx * (y_arr[..., 1:] + y_arr[..., :-1])).sum(-1)
-
-
 @util._wraps(np.trunc, module='numpy')
 @jit
 def trunc(x: ArrayLike) -> Array:
@@ -556,6 +540,12 @@ def transpose(a: ArrayLike, axes: Sequence[int] | None = None) -> Array:
   axes_ = list(range(ndim(a))[::-1]) if axes is None else axes
   axes_ = [_canonicalize_axis(i, ndim(a)) for i in axes_]
   return lax.transpose(a, axes_)
+
+
+@util._wraps(getattr(np, "permute_dims", None))
+def permute_dims(a: ArrayLike, /, axes: tuple[int, ...]) -> Array:
+  util.check_arraylike("permute_dims", a)
+  return lax.transpose(a, axes)
 
 
 @util._wraps(getattr(np, 'matrix_transpose', None))
@@ -2079,6 +2069,15 @@ def atleast_3d(*arys: ArrayLike) -> Array | list[Array]:
     return [atleast_3d(arr) for arr in arys]
 
 
+def _supports_buffer_protocol(obj):
+  try:
+    view = memoryview(obj)
+  except TypeError:
+    return False
+  else:
+    return True
+
+
 _ARRAY_DOC = """
 This function will create arrays on JAX's default device. For control of the
 device placement of data, see :func:`jax.device_put`. More information is
@@ -2157,14 +2156,9 @@ def array(object: Any, dtype: DTypeLike | None = None, copy: bool = True,
       out = stack([asarray(elt, dtype=dtype) for elt in object])
     else:
       out = np.array([], dtype=dtype)  # type: ignore[arg-type]
+  elif _supports_buffer_protocol(object):
+    out = np.array(memoryview(object), copy=copy)
   else:
-    try:
-      view = memoryview(object)
-    except TypeError:
-      pass  # `object` does not support the buffer interface.
-    else:
-      return array(np.asarray(view), dtype, copy, ndmin=ndmin)
-
     raise TypeError(f"Unexpected input type for array: {type(object)}")
 
   out_array: Array = lax_internal._convert_element_type(
@@ -2198,11 +2192,21 @@ def astype(x: ArrayLike, dtype: DTypeLike | None, /, *, copy: bool = True) -> Ar
 
 
 @util._wraps(np.asarray, lax_description=_ARRAY_DOC)
-def asarray(a: Any, dtype: DTypeLike | None = None, order: str | None = None) -> Array:
+def asarray(a: Any, dtype: DTypeLike | None = None, order: str | None = None,
+            *, copy: bool | None = None) -> Array:
+  # For copy=False, the array API specifies that we raise a ValueError if the input supports
+  # the buffer protocol but a copy is required. Since array() supports the buffer protocol
+  # via numpy, this is only the case when the default device is not 'cpu'
+  if (copy is False and not isinstance(a, Array)
+      and jax.default_backend() != 'cpu'
+      and _supports_buffer_protocol(a)):
+    raise ValueError(f"jnp.asarray: cannot convert object of type {type(a)} to JAX Array "
+                     f"on backend={jax.default_backend()!r} with copy=False. "
+                      "Consider using copy=None or copy=True instead.")
   dtypes.check_user_dtype_supported(dtype, "asarray")
   if dtype is not None:
     dtype = dtypes.canonicalize_dtype(dtype, allow_extended_dtype=True)  # type: ignore[assignment]
-  return array(a, dtype=dtype, copy=False, order=order)  # type: ignore
+  return array(a, dtype=dtype, copy=bool(copy), order=order)  # type: ignore
 
 
 @util._wraps(np.copy, lax_description=_ARRAY_DOC)
@@ -2394,7 +2398,15 @@ def fromiter(*args, **kwargs):
     "because of its potential side-effect of consuming the iterable object; for more information see "
     "https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions")
 
-@util._wraps(getattr(np, "from_dlpack", None))
+@util._wraps(getattr(np, "from_dlpack", None), lax_description="""
+.. note::
+
+   While JAX arrays are always immutable, dlpack buffers cannot be marked as
+   immutable, and it is possible for processes external to JAX to mutate them
+   in-place. If a jax Array is constructed from a dlpack buffer and the buffer
+   is later modified in-place, it may lead to undefined behavior when using
+   the associated JAX array.
+""")
 def from_dlpack(x: Any) -> Array:
   from jax.dlpack import from_dlpack  # pylint: disable=g-import-not-at-top
   return from_dlpack(x.__dlpack__())
@@ -3377,6 +3389,21 @@ def vdot(
              preferred_element_type=preferred_element_type)
 
 
+@util._wraps(getattr(np, "vecdot", None), lax_description=_PRECISION_DOC,
+             extra_params=_DOT_PREFERRED_ELEMENT_TYPE_DESCRIPTION)
+def vecdot(x1: ArrayLike, x2: ArrayLike, /, *, axis: int = -1,
+           precision: PrecisionLike = None,
+           preferred_element_type: DTypeLike | None = None) -> Array:
+  util.check_arraylike("jnp.vecdot", x1, x2)
+  x1_arr, x2_arr = asarray(x1), asarray(x2)
+  if x1_arr.shape[axis] != x2_arr.shape[axis]:
+    raise ValueError(f"axes must match; got shapes {x1_arr.shape} and {x2_arr.shape} with {axis=}")
+  x1_arr = jax.numpy.moveaxis(x1_arr, axis, -1)
+  x2_arr = jax.numpy.moveaxis(x2_arr, axis, -1)
+  return vectorize(partial(vdot, precision=precision, preferred_element_type=preferred_element_type),
+                   signature="(n),(n)->()")(x1_arr, x2_arr)
+
+
 @util._wraps(np.tensordot, lax_description=_PRECISION_DOC,
              extra_params=_DOT_PREFERRED_ELEMENT_TYPE_DESCRIPTION)
 def tensordot(a: ArrayLike, b: ArrayLike,
@@ -3894,24 +3921,40 @@ def _nanargmin(a, axis: int | None = None, keepdims : bool = False):
   return where(reductions.all(nan_mask, axis=axis, keepdims=keepdims), -1, res)
 
 
-@util._wraps(np.sort)
-@partial(jit, static_argnames=('axis', 'kind', 'order'))
+@util._wraps(np.sort,
+             extra_params="""
+kind : deprecated; specify sort algorithm using stable=True or stable=False
+order : not supported
+stable : bool, default=True
+    Specify whether to use a stable sort.
+descending : bool, default=False
+    Specify whether to do a descending sort.
+    """)
+@partial(jit, static_argnames=('axis', 'kind', 'order', 'stable', 'descending'))
 def sort(
     a: ArrayLike,
     axis: int | None = -1,
-    kind: str = "quicksort",
-    order: None = None,
+    kind: str | None = None,
+    order: None = None, *,
+    stable: bool = True,
+    descending: bool = False,
 ) -> Array:
   util.check_arraylike("sort", a)
-  if kind != 'quicksort':
-    warnings.warn("'kind' argument to sort is ignored.")
+  if kind is not None:
+    # Deprecated 2024-01-05
+    warnings.warn("The 'kind' argument to sort has no effect, and is deprecated. "
+                  "Use stable=True or stable=False to specify sort stability.",
+                  category=DeprecationWarning, stacklevel=2)
   if order is not None:
     raise ValueError("'order' argument to sort is not supported.")
-
   if axis is None:
-    return lax.sort(ravel(a), dimension=0)
+    arr = ravel(a)
+    axis = 0
   else:
-    return lax.sort(asarray(a), dimension=_canonicalize_axis(axis, ndim(a)))
+    arr = asarray(a)
+  dimension = _canonicalize_axis(axis, arr.ndim)
+  result = lax.sort(arr, dimension=dimension, is_stable=stable)
+  return lax.rev(result, dimensions=[dimension]) if descending else result
 
 
 @util._wraps(np.sort_complex)
@@ -3940,36 +3983,49 @@ def lexsort(keys: Array | np.ndarray | Sequence[ArrayLike], axis: int = -1) -> A
   return lax.sort((*key_arrays[::-1], iota), dimension=axis, num_keys=len(key_arrays))[-1]
 
 
-_ARGSORT_DOC = """
-Only :code:`kind='stable'` is supported. Other :code:`kind` values will produce
-a warning and be treated as if they were :code:`'stable'`.
-"""
-
-
-@util._wraps(np.argsort, lax_description=_ARGSORT_DOC)
-@partial(jit, static_argnames=('axis', 'kind', 'order'))
+@util._wraps(np.argsort,
+             extra_params="""
+kind : deprecated; specify sort algorithm using stable=True or stable=False
+order : not supported
+stable : bool, default=True
+    Specify whether to use a stable sort.
+descending : bool, default=False
+    Specify whether to do a descending sort.
+    """)
+@partial(jit, static_argnames=('axis', 'kind', 'order', 'stable', 'descending'))
 def argsort(
     a: ArrayLike,
     axis: int | None = -1,
-    kind: str = "stable",
+    kind: str | None = None,
     order: None = None,
+    *, stable: bool = True,
+    descending: bool = False,
 ) -> Array:
   util.check_arraylike("argsort", a)
   arr = asarray(a)
-  if kind != 'stable':
-    warnings.warn("'kind' argument to argsort is ignored; only 'stable' sorts "
-                  "are supported.")
+  if kind is not None:
+    # Deprecated 2024-01-05
+    warnings.warn("The 'kind' argument to argsort has no effect, and is deprecated. "
+                  "Use stable=True or stable=False to specify sort stability.",
+                  category=DeprecationWarning, stacklevel=2)
   if order is not None:
     raise ValueError("'order' argument to argsort is not supported.")
-
   if axis is None:
-    return argsort(arr.ravel(), 0)
+    arr = ravel(arr)
+    axis = 0
   else:
-    axis_num = _canonicalize_axis(axis, arr.ndim)
-    use_64bit_index = not core.is_constant_dim(arr.shape[axis_num]) or arr.shape[axis_num] >= (1 << 31)
-    iota = lax.broadcasted_iota(int64 if use_64bit_index else int_, arr.shape, axis_num)
-    _, perm = lax.sort_key_val(arr, iota, dimension=axis_num)
-    return perm
+    arr = asarray(a)
+  dimension = _canonicalize_axis(axis, arr.ndim)
+  use_64bit_index = not core.is_constant_dim(arr.shape[dimension]) or arr.shape[dimension] >= (1 << 31)
+  iota = lax.broadcasted_iota(int64 if use_64bit_index else int_, arr.shape, dimension)
+  # For stable descending sort, we reverse the array and indices to ensure that
+  # duplicates remain in their original order when the final indices are reversed.
+  # For non-stable descending sort, we can avoid these extra operations.
+  if descending and stable:
+    arr = lax.rev(arr, dimensions=[dimension])
+    iota = lax.rev(iota, dimensions=[dimension])
+  _, indices = lax.sort_key_val(arr, iota, dimension=dimension, is_stable=stable)
+  return lax.rev(indices, dimensions=[dimension]) if descending else indices
 
 
 @util._wraps(np.partition, lax_description="""

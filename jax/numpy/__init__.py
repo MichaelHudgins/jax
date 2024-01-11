@@ -189,6 +189,7 @@ from jax._src.numpy.lax_numpy import (
     packbits as packbits,
     pad as pad,
     partition as partition,
+    permute_dims as permute_dims,
     pi as pi,
     piecewise as piecewise,
     place as place,
@@ -226,7 +227,6 @@ from jax._src.numpy.lax_numpy import (
     tensordot as tensordot,
     tile as tile,
     trace as trace,
-    trapz as _deprecated_trapz,
     transpose as transpose,
     tri as tri,
     tril as tril,
@@ -249,6 +249,7 @@ from jax._src.numpy.lax_numpy import (
     unwrap as unwrap,
     vander as vander,
     vdot as vdot,
+    vecdot as vecdot,
     vsplit as vsplit,
     vstack as vstack,
     where as where,
@@ -313,18 +314,23 @@ from jax._src.numpy.reductions import (
 )
 
 from jax._src.numpy.setops import (
-    in1d as _deprecated_in1d,
     intersect1d as intersect1d,
     isin as isin,
     setdiff1d as setdiff1d,
     setxor1d as setxor1d,
     union1d as union1d,
     unique as unique,
+    unique_all as unique_all,
+    unique_counts as unique_counts,
+    unique_inverse as unique_inverse,
+    unique_values as unique_values,
 )
 
 from jax._src.numpy.ufuncs import (
     abs as abs,
     absolute as absolute,
+    acos as acos,
+    acosh as acosh,
     add as add,
     arccos as arccos,
     arccosh as arccosh,
@@ -333,9 +339,17 @@ from jax._src.numpy.ufuncs import (
     arctan as arctan,
     arctan2 as arctan2,
     arctanh as arctanh,
+    asin as asin,
+    asinh as asinh,
+    atan as atan,
+    atanh as atanh,
+    atan2 as atan2,
     bitwise_and as bitwise_and,
     bitwise_count as bitwise_count,
+    bitwise_invert as bitwise_invert,
+    bitwise_left_shift as bitwise_left_shift,
     bitwise_not as bitwise_not,
+    bitwise_right_shift as bitwise_right_shift,
     bitwise_or as bitwise_or,
     bitwise_xor as bitwise_xor,
     cbrt as cbrt,
@@ -393,6 +407,7 @@ from jax._src.numpy.ufuncs import (
     nextafter as nextafter,
     not_equal as not_equal,
     positive as positive,
+    pow as pow,
     power as power,
     rad2deg as rad2deg,
     radians as radians,
@@ -430,58 +445,3 @@ try:
   from numpy import issubsctype as _deprecated_issubsctype
 except ImportError:
   _deprecated_issubsctype = None
-
-# Deprecations
-
-_deprecations = {
-    # Added August 10, 2023:
-    "NINF": (
-        "jax.numpy.NINF is deprecated. Use -jax.numpy.inf instead.",
-        -inf,
-    ),
-    "NZERO": (
-        "jax.numpy.NZERO is deprecated. Use -0.0 instead.",
-        -0.0,
-    ),
-    "PZERO": (
-        "jax.numpy.PZERO is deprecated. Use 0.0 instead.",
-        0.0,
-    ),
-    # Added Aug 17, 2023:
-    "issubsctype": (
-        "jax.numpy.issubsctype is deprecated. In most cases, jax.numpy.issubdtype can be used instead.",
-        _deprecated_issubsctype,
-    ),
-    # Added Aug 22, 2023
-    "row_stack": (
-        "jax.numpy.row_stack is deprecated. Use jax.numpy.vstack instead.",
-        vstack,
-    ),
-    # Added Aug 23, 2023
-    "in1d": (
-        "jax.numpy.in1d is deprecated. Use jax.numpy.isin instead.",
-        _deprecated_in1d,
-    ),
-    # Added Aug 24, 2023
-    "trapz": (
-        "jax.numpy.trapz is deprecated. Use jax.scipy.integrate.trapezoid instead.",
-        _deprecated_trapz,
-    ),
-}
-
-import typing
-if typing.TYPE_CHECKING:
-  row_stack = vstack
-  NINF = -inf
-  NZERO = -0.0
-  PZERO = 0.0
-  issubsctype = _deprecated_issubsctype
-  in1d = _deprecated_in1d
-  trapz = _deprecated_trapz
-else:
-  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
-  __getattr__ = _deprecation_getattr(__name__, _deprecations)
-  del _deprecation_getattr
-del typing
-del _deprecated_in1d
-del _deprecated_trapz

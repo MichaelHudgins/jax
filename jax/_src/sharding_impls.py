@@ -110,6 +110,10 @@ class XLACompatibleSharding(sharding.Sharding):
 
   @functools.cached_property
   def _addressable_device_assignment(self) -> XLADeviceAssignment:
+    if self.is_fully_addressable:
+      return self._device_assignment
+    if hasattr(self, '_internal_device_list'):
+      return tuple(self._internal_device_list.addressable_device_list)
     return tuple(d for d in self._device_assignment
                  if d.process_index == d.client.process_index())
 
@@ -170,9 +174,63 @@ def device_replica_id_map(sharding, global_shape: Shape) -> Mapping[Device, int]
 @functools.lru_cache(maxsize=4096)
 def named_sharding_to_xla_hlo_sharding(
     self, num_dimensions: int) -> xc.HloSharding:
-  sharding_spec, special_axes = self._get_sharding_spec(
-      num_dimensions, self._manual_axes)
-  return sharding_spec.sharding_proto(special_axes=special_axes)
+  mesh_shape = self.mesh.shape
+  array_mapping = get_array_mapping(self._parsed_pspec)
+  mesh_axis_pos = {name: i for i, name in enumerate(self.mesh.axis_names)}
+
+  special_axes = {}
+  if self._manual_axes:
+    axis_names = self.mesh.axis_names
+    for manual_axis in self._manual_axes:
+      special_axes[axis_names.index(manual_axis)] = xc.OpSharding.Type.MANUAL
+
+  replicated_mesh_axes = []
+  for i, (axis_name, axis_val) in enumerate(mesh_shape.items()):
+    if axis_name not in array_mapping:  # type: ignore
+      replicated_mesh_axes.append((i, axis_val))
+
+  if len(replicated_mesh_axes) == len(mesh_shape) and not special_axes:
+    return xc.HloSharding.replicate()
+
+  mesh_permutation = []
+  new_mesh_shape = [1] * num_dimensions
+  for name, pos in sorted(array_mapping.items(), key=lambda x: x[1]):  # type: ignore
+    new_mesh_shape[pos] *= mesh_shape[name]
+    mesh_permutation.append(mesh_axis_pos[name])
+
+  last_tile_dims = []
+  if replicated_mesh_axes:
+    axes_by_type = collections.defaultdict(list)
+    size_by_type = collections.defaultdict(lambda: 1)  # type: ignore
+    assert {x[0] for x in replicated_mesh_axes}.issuperset(set(special_axes.keys()))
+    for i, size in replicated_mesh_axes:
+      ty = special_axes.get(i, xc.OpSharding.Type.REPLICATED)
+      axes_by_type[ty].append(i)
+      size_by_type[ty] *= size
+    for ty, axes in sorted(axes_by_type.items(), key=lambda x: x[0].value):
+      last_tile_dims.append(ty)
+      new_mesh_shape.append(size_by_type[ty])
+      mesh_permutation.extend(axes)
+
+  # Explanation of the parameters of `HloSharding.iota_tile`.
+  # This is the HloShardingV2 format:
+  #   * dims: How many ways each dimension is sharded.
+  #       Replicated/Manual dims are added added at the end
+  #   * reshape_dims: This is the just the shape of the mesh.
+  #   * transpose_perm: This is the order in which mesh axes in PartitionSpec
+  #       appear relative to mesh.axis_names order.
+  #   * subgroup_types: List of type of OpSharding. Type can be REPLICATED and MANUAL.
+  # Let's see an example:
+  #   Consider input_shape=(8, 4, 2, 2), mesh={'a': 2, 'b': 2, 'c': 2, 'd': 2}
+  #   and partition_spec=P(None, ('d', 'b'), 'c').
+  #   Arguments to iota_tile will be:
+  #     dims = [1, 4, 2, 1, 2]  # 'a' is replicated hence `2` is at the end.
+  #     reshape_dims = [2, 2, 2, 2]
+  #     transpose_perm = [3, 1, 2, 0]  # 'a' is replicated hence 0 is at the end
+  #     subgroup_types = [xc.OpSharding.Type.REPLICATED]
+  return xc.HloSharding.iota_tile(
+      dims=new_mesh_shape, reshape_dims=tuple(self.mesh.shape.values()),
+      transpose_perm=mesh_permutation, subgroup_types=last_tile_dims)
 
 
 @use_cpp_class(xc.NamedSharding)
@@ -326,21 +384,6 @@ class NamedSharding(XLACompatibleSharding):
 
   def with_memory_kind(self, kind: str) -> NamedSharding:
     return NamedSharding(self.mesh, self.spec, memory_kind=kind)
-
-  def _get_sharding_spec(self, num_dimensions, manual_axes):
-    assert self._parsed_pspec is not None
-    array_mapping = get_array_mapping(self._parsed_pspec)
-    # TODO(yashkatariya): Move away from sharding spec in NamedSharding
-    # since we don't really need sharding spec.
-    sharding_spec = sharding_specs.new_mesh_sharding_specs(
-        self.mesh.shape, self.mesh.axis_names)(num_dimensions, array_mapping)
-    # Used in `with_sharding_constraint`.
-    special_axes = {}
-    if manual_axes:
-      axis_names = self.mesh.axis_names
-      for manual_axis in manual_axes:
-        special_axes[axis_names.index(manual_axis)] = xc.OpSharding.Type.MANUAL
-    return sharding_spec, special_axes
 
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return named_sharding_to_xla_hlo_sharding(self, num_dimensions)
@@ -530,7 +573,7 @@ class PmapSharding(XLACompatibleSharding):
       return None
 
   def with_memory_kind(self, kind: str):
-    return NotImplementedError("pmap does not support memories.")
+    raise NotImplementedError("pmap does not support memories.")
 
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     raise NotImplementedError("pmap doesn't use OpSharding.")
@@ -653,7 +696,7 @@ class PositionalSharding(XLACompatibleSharding):
     body = np.array2string(ids, prefix=cls_name + '(', suffix=')',
                            max_line_width=100)
     mem = '' if self._memory_kind is None else f', memory_kind={self._memory_kind}'
-    return f'{cls_name}({body}{mem})'
+    return f'{cls_name}({body}{mem}, shape={self.shape})'
 
   def reshape(self, *shape) -> PositionalSharding:
     return self._remake(self._devices, self._ids.reshape(*shape))

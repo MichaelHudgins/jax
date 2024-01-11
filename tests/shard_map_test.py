@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Sequence, Iterable, Iterator, Generator
 from functools import partial
 import itertools as it
@@ -19,7 +21,7 @@ import math
 import operator as op
 import os
 from types import SimpleNamespace
-from typing import Any, NamedTuple, Callable, Optional, TypeVar, Union
+from typing import Any, NamedTuple, Callable, TypeVar
 import unittest
 
 from absl.testing import absltest
@@ -29,7 +31,7 @@ import numpy as np
 import jax
 import jax.ad_checkpoint
 from jax import lax
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax._src import config
 from jax._src import core
@@ -42,6 +44,7 @@ from jax._src import linear_util as lu
 from jax._src import tree_util
 import jax.numpy as jnp
 
+from jax.experimental.custom_partitioning import custom_partitioning
 from jax.experimental.shard_map import shard_map
 
 config.parse_flags_with_absl()
@@ -819,7 +822,7 @@ class ShardMapTest(jtu.JaxTestCase):
   # TODO(mattjj): consider moving this method to be a helper in jtu
   def assert_dce_result(self, jaxpr: core.Jaxpr, used_outputs: list[bool],
                         expected_used_inputs: list[bool],
-                        expected_num_eqns: Optional[int] = None,
+                        expected_num_eqns: int | None = None,
                         check_diff: bool = True):
     jaxpr_dce, used_inputs = pe.dce_jaxpr(jaxpr, used_outputs)
     core.check_jaxpr(jaxpr_dce)
@@ -842,6 +845,14 @@ class ShardMapTest(jtu.JaxTestCase):
     if check_diff and expected_num_eqns != 0:
       f = lambda *args: core.eval_jaxpr(jaxpr_dce, consts, *args)
       jtu.check_grads(f, inputs_dce, order=2, modes=['rev'])
+
+  def test_returned_out_sharding(self):
+    mesh = jtu.create_global_mesh((1, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    inp = jax.device_put(jnp.zeros((2, 2)), s)
+    out = shard_map(lambda x: x, mesh, P('x', 'y'), P('x', 'y'))(inp)
+    self.assertEqual(out.sharding, s)
+    self.assertArraysEqual(out, inp)
 
   def test_dce(self):
     mesh = jtu.create_global_mesh((4, 2), ('i', 'j'))
@@ -1024,6 +1035,22 @@ class ShardMapTest(jtu.JaxTestCase):
     y_, x_bar = jax.value_and_grad(lambda x: g(x).sum())(x)
     self.assertAllClose(y_, (2 * x * x).sum(), check_dtypes=True)
     self.assertAllClose(x_bar, jnp.ones_like(x) + 2 * x, check_dtypes=True)
+
+  def test_same_pspec_eager_shard_map(self):
+    # This behavior is not guaranteed by JAX and this test can be changed if
+    # the behavior changes.
+    mesh = jtu.create_global_mesh((1, 4, 1), ('data', 'seq', 'model'))
+
+    def f(x):
+      return x * x + 2
+
+    x = jnp.ones([2, 16, 4])
+    x_spec = jax.sharding.PartitionSpec("data", "seq", "model")
+    x = jax.device_put(x, jax.sharding.NamedSharding(mesh, x_spec))
+    shard_f = shard_map(f, mesh=mesh, in_specs=x_spec, out_specs=x_spec)
+
+    y = shard_f(x)
+    self.assertEqual(x_spec, y.sharding.spec)
 
   @parameterized.parameters([True, False])
   def test_rewrite_process_custom_vjp_call_match_less_replicated(self, jit):
@@ -1292,6 +1319,12 @@ class ShardMapTest(jtu.JaxTestCase):
     y = f(a, b)  # don't crash
     self.assertAllClose(y, a @ b, check_dtypes=False, atol=1e-2, rtol=1e-2)
 
+  def test_cumsum(self):
+    mesh = jtu.create_global_mesh((4,), ('i',))
+    x = jnp.arange(8.)
+    shard_map(jnp.cumsum, mesh=mesh, in_specs=P('i'), out_specs=P('i')
+              )(x)  # don't crash
+
   def test_custom_jvp_inside_jit(self):
     mesh = jtu.create_global_mesh((4,), ('batch',))
     x = shard_map(jax.jit(jax.nn.relu),
@@ -1304,13 +1337,44 @@ class ShardMapTest(jtu.JaxTestCase):
     shard_map(lambda k: jax.random.normal(k[0], (1,)),
               mesh=mesh, in_specs=P('i'), out_specs=P('i'))(keys)  # don't crash
 
+  def test_error_for_variable_num_args(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+
+    def f(*args):
+      return args[0] @ args[1]
+
+    shard_f = shard_map(
+      f, mesh, in_specs=(P('x', 'y', None), P('x', 'y', None)), out_specs=P('x', 'y'))
+
+    with self.assertRaisesRegex(ValueError, "shard_map applied to the function 'f'"):
+      shard_f(jnp.ones((8, 8)), jnp.ones((8, 8)))
+
+  def test_custom_vjp_replication_error_message_hint(self):
+    mesh = Mesh(np.array(jax.devices()[:4]), ('i',))
+
+    @jax.custom_vjp
+    def f(x):
+      return jax.lax.psum(x, 'i')
+    def f_fwd(x):
+      return f(x), None
+    def f_bwd(_, g):
+      return jax.lax.psum(g, 'i'),
+    f.defvjp(f_fwd, f_bwd)
+
+    @partial(shard_map, mesh=mesh, in_specs=P('i'), out_specs=P())
+    def g(x):
+      return f(f(x))
+
+    with self.assertRaisesRegex(Exception, r"check_rep=False"):
+      jax.grad(lambda x: g(x).sum())(jnp.ones(4))
+
 
 class FunSpec(NamedTuple):
   name: str
   num_inputs: int
   fun: Callable
   out_rep: Callable
-  valid_types: Optional[Callable] = None
+  valid_types: Callable | None = None
 
 fun_specs = [
     FunSpec('id', 1, lambda x: x, lambda r: r),
@@ -1476,8 +1540,8 @@ def dilate(mesh: Mesh, spec: P, shape: ShapeDtypeDuck) -> ShapeDtypeDuck:
   return jax.ShapeDtypeStruct(new_shape, shape.dtype)
 
 def make_out_specs(
-    mesh: MeshDuck, out_types: Union[ShapeDtypeDuck, Sequence[ShapeDtypeDuck]],
-    out_reps: Union[set[core.AxisName], Sequence[set[core.AxisName]]]
+    mesh: MeshDuck, out_types: ShapeDtypeDuck | Sequence[ShapeDtypeDuck],
+    out_reps: set[core.AxisName] | Sequence[set[core.AxisName]]
   ) -> Chooser:
   if type(out_types) is not tuple:
     out_spec = yield from make_out_spec(mesh, out_types, out_reps)  # type: ignore
@@ -1522,11 +1586,11 @@ def sample_shmap_batched(bdim_size: int) -> Chooser:
   return name + f'_vmap_{bdims}', bdims, *shmap_specs, batch_args, ref
 
 def all_bdims(*shapes: tuple[int, ...]
-              ) -> Iterator[Sequence[Optional[int]]]:
+              ) -> Iterator[Sequence[int | None]]:
   bdims = ((None, *range(len(shape) + 1)) for shape in shapes)
   return (t for t in it.product(*bdims) if not all(e is None for e in t))
 
-def batchify_arg(size: int, bdim: Optional[int], x: Arr) -> Arr:
+def batchify_arg(size: int, bdim: int | None, x: Arr) -> Arr:
   if bdim is None:
     return x
   else:
@@ -1534,7 +1598,7 @@ def batchify_arg(size: int, bdim: Optional[int], x: Arr) -> Arr:
         [1 if i != bdim else -1 for i in range(len(x.shape) + 1)])
     return np.expand_dims(x, bdim) * iota
 
-def args_slicer(args: Sequence[Arr], bdims: Sequence[Optional[int]]
+def args_slicer(args: Sequence[Arr], bdims: Sequence[int | None]
                 ) -> Callable[[int], Sequence[Arr]]:
   def slicer(x, bdim):
     if bdim is None:
@@ -1663,6 +1727,61 @@ class ShardMapSystematicTest(jtu.JaxTestCase):
       expected = tree_util.tree_unflatten(treedef, slices)
     tol = 1e-2 if jtu.test_device_matches(['tpu']) else None
     self.assertAllClose(ans, expected, check_dtypes=False, atol=tol, rtol=tol)
+
+@jtu.pytest_mark_if_available('multiaccelerator')
+class CustomPartitionerTest(jtu.JaxTestCase):
+
+  def skip_if_custom_partitioning_not_supported(self):
+    if jtu.is_cloud_tpu():
+      raise unittest.SkipTest("Custom partitioning is not supported on libtpu.")
+    if xla_bridge.using_pjrt_c_api():
+      raise unittest.SkipTest('custom partitioning not implemented in PJRT C API')
+
+  def test_custom_partitioning(self):
+    self.skip_if_custom_partitioning_not_supported()
+
+    mesh, a, _ = create_inputs(P('z', ('x', 'y')), P(None, None))
+    assert a.addressable_data(0).shape == (4, 2)
+
+    def partition(mesh, arg_shapes, result_shape):
+      def lower_fn(x):
+        return x
+
+      return (
+          mesh,
+          lower_fn,
+          arg_shapes[0].sharding,
+          (arg_shapes[0].sharding,),
+      )
+
+    def infer_sharding_from_operands(mesh, arg_shapes, result_shape):
+      return arg_shapes[0].sharding
+
+    def propagate_user_sharding(mesh, user_shape):
+      return user_shape.sharding
+
+    @custom_partitioning
+    def f(x):
+      return x
+
+    f.def_partition(
+        infer_sharding_from_operands=infer_sharding_from_operands,
+        partition=partition,
+        propagate_user_sharding=propagate_user_sharding,
+    )
+
+    @jax.jit
+    def fwd(a):
+      c = shard_map(
+          f,
+          mesh,
+          check_rep=False,
+          in_specs=(P('z', ('x', 'y')),),
+          out_specs=P('z', ('x', 'y')))(a)
+      return c
+
+    c = fwd(a)
+    self.assertEqual(c.addressable_data(0).shape, (4, 2))
 
 
 if __name__ == '__main__':

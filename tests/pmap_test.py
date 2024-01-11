@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -21,7 +22,7 @@ import math
 import os
 from random import shuffle
 import re
-from typing import Optional, cast
+from typing import Union, cast
 import unittest
 from unittest import SkipTest
 import weakref
@@ -60,7 +61,7 @@ prev_xla_flags = None
 compatible_shapes = [[(3,)], [(3, 4), (3, 1), (1, 4)], [(2, 3, 4), (2, 1, 4)]]
 
 def all_bdims(*shapes, pmap):
-  bdims = (it.chain([cast(Optional[int], None)], range(len(shape) + 1))
+  bdims = (it.chain([cast(Union[int, None], None)], range(len(shape) + 1))
            for shape in shapes)
   return (t for t in it.product(*bdims) if not all(e is None for e in t))
 
@@ -2987,25 +2988,12 @@ class ShardArgsTest(jtu.JaxTestCase):
           # unsharded
           [(4, 8), pxla.ShardingSpec(sharding=(pxla.NoSharding(), pxla.NoSharding()),
                                      mesh_mapping=())],
-          # partitioned, 1 axis
-          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked([2]), pxla.NoSharding()),
-                                     mesh_mapping=(pxla.ShardedAxis(0),))],
-          # partitioned, 2 axes
-          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked([2]), pxla.Chunked([2])),
-                                     mesh_mapping=map(pxla.ShardedAxis, (0, 1)))],
-          # partitioned, 2 axes, permuted
-          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked([2]), pxla.Chunked([2])),
-                                     mesh_mapping=map(pxla.ShardedAxis, (1, 0)))],
           # replication + sharding
           [(2, 8), pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.NoSharding()),
                                      mesh_mapping=(pxla.ShardedAxis(0), pxla.Replicated(3)))],
           # replication, no sharding
           [(2, 8), pxla.ShardingSpec(sharding=(pxla.NoSharding(), pxla.NoSharding()),
                                      mesh_mapping=(pxla.Replicated(3),))],
-          # multiple replicated axes
-          [(1, 8), pxla.ShardingSpec(sharding=(pxla.Chunked([1]), pxla.Chunked([2])),
-                                     mesh_mapping=(pxla.Replicated(2), pxla.ShardedAxis(0),
-                                                   pxla.Replicated(2), pxla.ShardedAxis(1)))],
           # replicated scalar
           [(), pxla.ShardingSpec(sharding=(),
                                  mesh_mapping=(pxla.Replicated(2), pxla.Replicated(3)))],
@@ -3017,17 +3005,8 @@ class ShardArgsTest(jtu.JaxTestCase):
       raise SkipTest
     x = np.arange(math.prod(shape)).reshape(shape)
     arg = make_arg(x)
-    sharding = None
-    if any(isinstance(s, pxla.Unstacked) for s in spec.sharding):
-      sharding = jax.sharding.PmapSharding(jax.devices()[:nshards], spec)
-    else:
-      sharding = jax.sharding.GSPMDSharding(
-          jax.devices()[:nshards],
-          sharding_specs.sharding_spec_sharding_proto(spec))
-
-    results = pxla.shard_args(
-        jax.devices()[:nshards], [indices], [sharding], [arg]
-    )
+    sharding = jax.sharding.PmapSharding(jax.devices()[:nshards], spec)
+    results = pxla.shard_args([sharding], [arg])
     self.assertEqual(len(results), 1)
     if isinstance(results[0], array.ArrayImpl):
       bufs = results[0]._arrays

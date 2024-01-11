@@ -23,7 +23,7 @@ import scipy
 import scipy.linalg
 import scipy as osp
 
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 
 import jax
 from jax import jit, grad, jvp, vmap
@@ -32,6 +32,7 @@ from jax import numpy as jnp
 from jax import scipy as jsp
 from jax._src.lib import version as jaxlib_version
 from jax._src import config
+from jax._src.lax import linalg as lax_linalg
 from jax._src import test_util as jtu
 from jax._src import xla_bridge
 from jax._src.numpy.util import promote_dtypes_inexact
@@ -41,7 +42,6 @@ config.parse_flags_with_absl()
 scipy_version = tuple(map(int, scipy.version.version.split('.')[:3]))
 
 T = lambda x: np.swapaxes(x, -1, -2)
-
 
 float_types = jtu.dtypes.floating
 complex_types = jtu.dtypes.complex
@@ -109,7 +109,6 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     jtu.check_grads(jnp.linalg.det, (a,), 2, atol=1e-1, rtol=1e-1)
     # make sure there are no NaNs when a matrix is zero
     if len(shape) == 2:
-      pass
       jtu.check_grads(
         jnp.linalg.det, (jnp.zeros_like(a),), 1, atol=1e-1, rtol=1e-1)
     else:
@@ -613,6 +612,113 @@ class NumpyLinalgTest(jtu.JaxTestCase):
       jnp.linalg.norm(jnp.array([1.0, 2.0, 3.0]), ord="inf")
 
   @jtu.sample_product(
+      shape=[(2, 3), (4, 2, 3), (2, 3, 4, 5)],
+      dtype=float_types + complex_types,
+      keepdims=[True, False],
+      ord=[1, -1, 2, -2, np.inf, -np.inf, 'fro', 'nuc'],
+  )
+  def testMatrixNorm(self, shape, dtype, keepdims, ord):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, dtype)]
+    if jtu.numpy_version() < (2, 0, 0):
+      np_fn = partial(np.linalg.norm, ord=ord, keepdims=keepdims, axis=(-2, -1))
+    else:
+      np_fn = partial(np.linalg.matrix_norm, ord=ord, keepdims=keepdims)
+    jnp_fn = partial(jnp.linalg.matrix_norm, ord=ord, keepdims=keepdims)
+    self._CheckAgainstNumpy(np_fn, jnp_fn, args_maker, tol=1e-3)
+    self._CompileAndCheck(jnp_fn, args_maker)
+
+  @jtu.sample_product(
+      shape=[(3,), (3, 4), (2, 3, 4, 5)],
+      dtype=float_types + complex_types,
+      keepdims=[True, False],
+      axis=[0, None],
+      ord=[1, -1, 2, -2, np.inf, -np.inf],
+  )
+  def testVectorNorm(self, shape, dtype, keepdims, axis, ord):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, dtype)]
+    if jtu.numpy_version() < (2, 0, 0):
+      def np_fn(x, *, ord, keepdims, axis):
+        x = np.asarray(x)
+        if axis is None:
+          result = np_fn(x.ravel(), ord=ord, keepdims=False, axis=0)
+          return np.reshape(result, (1,) * x.ndim) if keepdims else result
+        return np.linalg.norm(x, ord=ord, keepdims=keepdims, axis=axis)
+    else:
+      np_fn = np.linalg.vector_norm
+    np_fn = partial(np_fn, ord=ord, keepdims=keepdims, axis=axis)
+    jnp_fn = partial(jnp.linalg.vector_norm, ord=ord, keepdims=keepdims, axis=axis)
+    self._CheckAgainstNumpy(np_fn, jnp_fn, args_maker, tol=1e-3)
+    self._CompileAndCheck(jnp_fn, args_maker)
+
+  # jnp.linalg.vecdot is an alias of jnp.vecdot; do a minimal test here.
+  @jtu.sample_product(
+      [
+        dict(lhs_shape=(2, 2, 2), rhs_shape=(2, 2), axis=0),
+        dict(lhs_shape=(2, 2, 2), rhs_shape=(2, 2), axis=1),
+        dict(lhs_shape=(2, 2, 2), rhs_shape=(2, 2), axis=-1),
+      ],
+      dtype=int_types + float_types + complex_types
+  )
+  @jax.default_matmul_precision("float32")
+  def testVecdot(self, lhs_shape, rhs_shape, axis, dtype):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(lhs_shape, dtype), rng(rhs_shape, dtype)]
+    np_fn = jtu.numpy_vecdot if jtu.numpy_version() < (2, 0, 0) else np.linalg.vecdot
+    np_fn = jtu.promote_like_jnp(partial(np_fn, axis=axis))
+    jnp_fn = partial(jnp.linalg.vecdot, axis=axis)
+    tol = {np.float16: 1e-2, np.float32: 2e-2, np.float64: 1e-12,
+           np.complex128: 1e-12}
+    self._CheckAgainstNumpy(np_fn, jnp_fn, args_maker, tol=tol)
+    self._CompileAndCheck(jnp_fn, args_maker, tol=tol)
+
+  # jnp.linalg.matmul is an alias of jnp.matmul; do a minimal test here.
+  @jtu.sample_product(
+      [
+        dict(lhs_shape=(3,), rhs_shape=(3,)), # vec-vec
+        dict(lhs_shape=(2, 3), rhs_shape=(3,)), # mat-vec
+        dict(lhs_shape=(3,), rhs_shape=(3, 4)), # vec-mat
+        dict(lhs_shape=(2, 3), rhs_shape=(3, 4)), # mat-mat
+      ],
+      dtype=float_types + complex_types
+  )
+  @jax.default_matmul_precision("float32")
+  def testMatmul(self, lhs_shape, rhs_shape, dtype):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(lhs_shape, dtype), rng(rhs_shape, dtype)]
+    np_fn = jtu.promote_like_jnp(
+        np.matmul if jtu.numpy_version() < (2, 0, 0) else np.linalg.matmul)
+    jnp_fn = jnp.linalg.matmul
+    tol = {np.float16: 1e-2, np.float32: 2e-2, np.float64: 1e-12,
+           np.complex128: 1e-12}
+    self._CheckAgainstNumpy(np_fn, jnp_fn, args_maker, tol=tol)
+    self._CompileAndCheck(jnp_fn, args_maker, tol=tol)
+
+  # jnp.linalg.tensordot is an alias of jnp.tensordot; do a minimal test here.
+  @jtu.sample_product(
+      [
+        dict(lhs_shape=(2, 2, 2), rhs_shape=(2, 2), axes=0),
+        dict(lhs_shape=(2, 2, 2), rhs_shape=(2, 2), axes=1),
+        dict(lhs_shape=(2, 2, 2), rhs_shape=(2, 2), axes=2),
+      ],
+      dtype=float_types + complex_types
+  )
+  @jax.default_matmul_precision("float32")
+  def testTensordot(self, lhs_shape, rhs_shape, axes, dtype):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(lhs_shape, dtype), rng(rhs_shape, dtype)]
+    np_fn = jtu.promote_like_jnp(
+      partial(
+        np.tensordot if jtu.numpy_version() < (2, 0, 0) else np.linalg.tensordot,
+        axes=axes))
+    jnp_fn = partial(jnp.linalg.tensordot, axes=axes)
+    tol = {np.float16: 1e-2, np.float32: 2e-2, np.float64: 1e-12,
+           np.complex128: 1e-12}
+    self._CheckAgainstNumpy(np_fn, jnp_fn, args_maker, tol=tol)
+    self._CompileAndCheck(jnp_fn, args_maker, tol=tol)
+
+  @jtu.sample_product(
       [
           dict(m=m, n=n, full_matrices=full_matrices, hermitian=hermitian)
           for (m, n), full_matrices in (
@@ -913,6 +1019,20 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     self._CompileAndCheck(jnp.linalg.solve, args_maker)
 
   @jtu.sample_product(
+      lhs_shape=[(2, 2), (2, 2, 2), (2, 2, 2, 2), (2, 2, 2, 2, 2)],
+      rhs_shape=[(2,), (2, 2), (2, 2, 2), (2, 2, 2, 2)]
+  )
+  def testSolveBroadcasting(self, lhs_shape, rhs_shape):
+    # Batched solve can involve some ambiguities; this test checks
+    # that we match NumPy's convention in all cases.
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(lhs_shape, 'float32'), rng(rhs_shape, 'float32')]
+    # As of numpy 1.26.3, np.linalg.solve fails when this condition is not met.
+    if len(lhs_shape) == 2 or len(rhs_shape) > 1:
+      self._CheckAgainstNumpy(np.linalg.solve, jnp.linalg.solve, args_maker, tol=1E-3)
+    self._CompileAndCheck(jnp.linalg.solve, args_maker)
+
+  @jtu.sample_product(
     shape=[(1, 1), (4, 4), (2, 5, 5), (100, 100), (5, 5, 5), (0, 0)],
     dtype=float_types,
   )
@@ -1092,6 +1212,45 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     cube_func = jax.jacfwd(hess_func)
     self.assertFalse(np.any(np.isnan(cube_func(a))))
 
+  @jtu.sample_product(
+    [dict(lhs_shape=lhs_shape, rhs_shape=rhs_shape, axis=axis)
+      for lhs_shape, rhs_shape, axis in [
+          [(3,), (3,), -1],
+          [(2, 3), (2, 3), -1],
+          [(3, 4), (3, 4), 0],
+          [(3, 5), (3, 4, 5), 0]
+      ]],
+    lhs_dtype=jtu.dtypes.numeric,
+    rhs_dtype=jtu.dtypes.numeric,
+  )
+  @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
+  def testCross(self, lhs_shape, rhs_shape, lhs_dtype, rhs_dtype, axis):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(lhs_shape, lhs_dtype), rng(rhs_shape, rhs_dtype)]
+    lax_fun = partial(jnp.linalg.cross, axis=axis)
+    np_fun = jtu.promote_like_jnp(partial(
+      np.cross if jtu.numpy_version() < (2, 0, 0) else np.linalg.cross,
+      axis=axis))
+    with jtu.strict_promotion_if_dtypes_match([lhs_dtype, rhs_dtype]):
+      self._CheckAgainstNumpy(np_fun, lax_fun, args_maker)
+      self._CompileAndCheck(lax_fun, args_maker)
+
+  @jtu.sample_product(
+      lhs_shape=[(0,), (3,), (5,)],
+      rhs_shape=[(0,), (3,), (5,)],
+      lhs_dtype=jtu.dtypes.numeric,
+      rhs_dtype=jtu.dtypes.numeric,
+  )
+  def testOuter(self, lhs_shape, rhs_shape, lhs_dtype, rhs_dtype):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(lhs_shape, lhs_dtype), rng(rhs_shape, rhs_dtype)]
+    lax_fun = jnp.linalg.outer
+    np_fun = jtu.promote_like_jnp(
+      np.outer if jtu.numpy_version() < (2, 0, 0) else np.linalg.outer)
+    with jtu.strict_promotion_if_dtypes_match([lhs_dtype, rhs_dtype]):
+      self._CheckAgainstNumpy(np_fun, lax_fun, args_maker)
+      self._CompileAndCheck(lax_fun, args_maker)
+
 
 class ScipyLinalgTest(jtu.JaxTestCase):
 
@@ -1131,6 +1290,13 @@ class ScipyLinalgTest(jtu.JaxTestCase):
     x = jnp.array([[-1., 3./2], [2./3, -1.]], dtype=np.float32)
     p, l, u = jsp.linalg.lu(x)
     self.assertAllClose(x, np.matmul(p, np.matmul(l, u)))
+
+  @parameterized.parameters(lax_linalg.lu, lax_linalg._lu_python)
+  def testLuOnZeroMatrix(self, lu):
+    # Regression test for https://github.com/google/jax/issues/19076
+    x = jnp.zeros((2, 2), dtype=np.float32)
+    x_lu, _, _ = lu(x)
+    self.assertArraysEqual(x_lu, x)
 
   @jtu.sample_product(
     shape=[(1, 1), (4, 5), (10, 5), (10, 10), (6, 7, 7)],
@@ -1865,6 +2031,21 @@ class LaxLinalgTest(jtu.JaxTestCase):
 
     Ts, Ss = vmap(lax.linalg.schur)(args)
     self.assertAllClose(reconstruct(Ss, Ts), args, atol=1e-4)
+
+  @jtu.sample_product(
+    shape=[(2, 3), (2, 3, 4), (2, 3, 4, 5)],
+    dtype=float_types + complex_types,
+  )
+  def testMatrixTranspose(self, shape, dtype):
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, dtype)]
+    jnp_fun = jnp.linalg.matrix_transpose
+    if jtu.numpy_version() < (2, 0, 0):
+      np_fun = lambda x: np.swapaxes(x, -1, -2)
+    else:
+      np_fun = np.linalg.matrix_transpose
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
+    self._CompileAndCheck(jnp_fun, args_maker)
 
 
 if __name__ == "__main__":

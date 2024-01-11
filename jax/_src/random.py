@@ -14,13 +14,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 from functools import partial
 import math
 from operator import index
 import typing
 from typing import Union
-from collections.abc import Hashable
 import warnings
 
 import numpy as np
@@ -233,27 +232,6 @@ def _check_default_impl_with_no_custom_prng(impl, name):
     raise RuntimeError('jax_enable_custom_prng must be enabled in order '
                        f'to seed an RNG with an implementation "{name}" '
                        f'differing from the default "{default_name}".')
-
-def threefry2x32_key(seed: int | ArrayLike) -> KeyArray:
-  """Creates a threefry2x32 PRNG key from an integer seed."""
-  impl = prng.threefry_prng_impl
-  _check_default_impl_with_no_custom_prng(impl, 'threefry2x32')
-  key = prng.random_seed(seed, impl=impl)
-  return _return_prng_keys(True, key)
-
-def rbg_key(seed: int | ArrayLike) -> KeyArray:
-  """Creates an RBG PRNG key from an integer seed."""
-  impl = prng.rbg_prng_impl
-  _check_default_impl_with_no_custom_prng(impl, 'rbg')
-  key = prng.random_seed(seed, impl=impl)
-  return _return_prng_keys(True, key)
-
-def unsafe_rbg_key(seed: int | ArrayLike) -> KeyArray:
-  """Creates an unsafe RBG PRNG key from an integer seed."""
-  impl = prng.unsafe_rbg_prng_impl
-  _check_default_impl_with_no_custom_prng(impl, 'unsafe_rbg')
-  key = prng.random_seed(seed, impl=impl)
-  return _return_prng_keys(True, key)
 
 
 def fold_in(key: KeyArrayLike, data: IntegerArray) -> KeyArray:
@@ -1050,7 +1028,7 @@ def dirichlet(key: KeyArrayLike,
               dtype: DTypeLikeFloat = float) -> Array:
   r"""Sample Dirichlet random values with given shape and float dtype.
 
-  The values are distributed according the the probability density function:
+  The values are distributed according to the probability density function:
 
   .. math::
      f(\{x_i\}; \{\alpha_i\}) = \propto \prod_{i=1}^k x_i^{\alpha_i - 1}
@@ -1121,7 +1099,7 @@ def exponential(key: KeyArrayLike,
                 dtype: DTypeLikeFloat = float) -> Array:
   r"""Sample Exponential random values with given shape and float dtype.
 
-  The values are distributed according the the probability density function:
+  The values are distributed according to the probability density function:
 
   .. math::
      f(x) = e^{-x}
@@ -1289,7 +1267,7 @@ def gamma(key: KeyArrayLike,
           dtype: DTypeLikeFloat = float) -> Array:
   r"""Sample Gamma random values with given shape and float dtype.
 
-  The values are distributed according the the probability density function:
+  The values are distributed according to the probability density function:
 
   .. math::
      f(x;a) \propto x^{a - 1} e^{-x}
@@ -2279,7 +2257,7 @@ def geometric(key: KeyArrayLike,
   Args:
     key: a PRNG key used as the random key.
     p: a float or array of floats broadcast-compatible with ``shape``
-      representing the the probability of success of an individual trial.
+      representing the probability of success of an individual trial.
     shape: optional, a tuple of nonnegative integers specifying the result
       shape. Must be broadcast-compatible with ``p``. The default
       (None) produces a result shape equal to ``np.shape(p)``.
@@ -2608,7 +2586,7 @@ def binomial(
     n: a float or array of floats broadcast-compatible with ``shape``
       representing the number of trials.
     p: a float or array of floats broadcast-compatible with ``shape``
-      representing the the probability of success of an individual trial.
+      representing the probability of success of an individual trial.
     shape: optional, a tuple of nonnegative integers specifying the result
       shape. Must be broadcast-compatible with ``n`` and ``p``.
       The default (None) produces a result shape equal to ``np.broadcast(n, p).shape``.

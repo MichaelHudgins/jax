@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 import contextlib
 import functools
 import itertools as it
 from functools import partial
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable
 
 import jax
 from jax._src import config
@@ -28,9 +30,9 @@ from jax.tree_util import (tree_flatten, tree_unflatten,
 from jax._src import core
 from jax._src import source_info_util
 from jax._src.ad_util import (
-    add_jaxvals, add_jaxvals_p, replace_internal_symbolic_zeros,
-    replace_rule_output_symbolic_zeros, Zero, zeros_like_aval,
-    zeros_like_jaxval, zeros_like_p)
+    add_jaxvals, replace_internal_symbolic_zeros, zeros_like_jaxval,
+    replace_rule_output_symbolic_zeros, Zero, zeros_like_aval)
+from jax._src.ad_util import zeros_like_p, add_jaxvals_p  # noqa: F401
 from jax._src.api_util import flatten_fun, flatten_fun_nokwargs
 from jax._src.core import (Trace, Tracer, get_aval, call_p, Primitive, Literal,
                            raise_to_shaped)
@@ -46,7 +48,7 @@ def identity(x): return x
 
 def _update_annotation(
     f: lu.WrappedFun,
-    orig_type: Optional[tuple[tuple[core.AbstractValue, bool], ...]],
+    orig_type: tuple[tuple[core.AbstractValue, bool], ...] | None,
     explicit_nonzeros: list[bool]
   ) -> lu.WrappedFun:
   if orig_type is None:
@@ -206,7 +208,7 @@ def backward_pass(jaxpr: core.Jaxpr, reduce_axes, transform_stack,
     #   assert v.aval.strip_weak_type().strip_named_shape() == joined_aval, (prim, v.aval, ct_aval)
 
   def read_cotangent(v):
-    return ct_env.pop(v, Zero(v.aval))
+    return ct_env.pop(v, Zero(v.aval.at_least_vspace()))
 
   def read_primal(v):
     if type(v) is Literal:
@@ -581,24 +583,11 @@ def zero_jvp(primitive, primals, tangents, **params):
   r = primitive.bind(*primals, **params)
   return r, Zero.from_value(r)
 
-
-deflinear2(zeros_like_p, lambda t, _: [Zero.from_value(t)])
 deflinear2(add_jaxvals_p, lambda t, *args: (t, t))
 
-def instantiate_zeros(tangent):
-  if type(tangent) is not Zero:
-    return tangent
-  return instantiate_zeros_aval(tangent.aval, tangent)
 
-# This function seems similar to instantiate_zeros, but it is sometimes used
-# to instantiate zero abstract units with a different aval
-def instantiate_zeros_aval(aval, tangent):
-  if type(tangent) is not Zero:
-    return tangent
-  assert tangent.aval == aval
-  if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended):
-    return aval.dtype._rules.make_tangent(aval.shape, aval.dtype)
-  return zeros_like_aval(aval)
+def instantiate_zeros(tangent):
+  return zeros_like_aval(tangent.aval) if type(tangent) is Zero else tangent
 
 @lu.transformation_with_aux
 def traceable(in_tree, *primals_and_tangents):
@@ -694,7 +683,7 @@ def map_transpose(primitive, params, call_jaxpr, args, ct, _, reduce_axes):
 
 
 def jvp_jaxpr(jaxpr: core.ClosedJaxpr, nonzeros: Sequence[bool],
-              instantiate: Union[bool, Sequence[bool]]
+              instantiate: bool | Sequence[bool]
               ) -> tuple[core.ClosedJaxpr, list[bool]]:
   if type(instantiate) is bool:
     instantiate = (instantiate,) * len(jaxpr.out_avals)
@@ -758,7 +747,7 @@ def _custom_lin_transpose(cts_out, *invals, num_res, bwd, out_avals,
   if symbolic_zeros:
     cts_out = map(replace_internal_symbolic_zeros, cts_out)
   else:
-    cts_out = map(instantiate_zeros_aval, out_avals, cts_out)
+    cts_out = map(instantiate_zeros, cts_out)
   cts_in = bwd(*res, *cts_out)
   cts_in = map(replace_rule_output_symbolic_zeros, cts_in)
   return [None] * num_res + list(cts_in)

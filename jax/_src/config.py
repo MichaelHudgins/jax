@@ -210,6 +210,7 @@ class Config:
             self.jax_numpy_rank_promotion, self.jax_default_matmul_precision,
             self.jax_dynamic_shapes, self.jax_numpy_dtype_promotion,
             self.jax_default_device,
+            self.jax_random_seed_offset,
             self.jax_threefry_partitionable,
             self.jax_softmax_custom_jvp,
             self.jax_enable_memories,
@@ -655,6 +656,7 @@ class _GlobalExtraJitContext(NamedTuple):
   numpy_dtype_promotion: str | None = None
   default_matmul_precision: Any | None = None
   dynamic_shapes: bool = False
+  random_seed_offset: int = 0
   threefry_partitionable: bool = False
   softmax_custom_jvp: bool = False
   xla_profile_version: int = 0
@@ -682,6 +684,7 @@ class _ThreadLocalExtraJitContext(NamedTuple):
   numpy_dtype_promotion: str | None = None
   default_matmul_precision: Any | None = None
   dynamic_shapes: bool = False
+  random_seed_offset: int = 0
   threefry_partitionable: bool = False
   softmax_custom_jvp: bool = False
   xla_profile_version: int = 0
@@ -775,6 +778,12 @@ enable_checks = define_bool_state(
     default=False,
     help='Turn on invariant checking for JAX internals. Makes things slower.')
 
+enable_key_reuse_checks = define_bool_state(
+    name='jax_enable_key_reuse_checks',
+    default=False,
+    help="Turn on experimental key reuse checking."
+)
+
 check_tracer_leaks = define_bool_state(
     name='jax_check_tracer_leaks',
     default=False,
@@ -808,6 +817,14 @@ log_compiles = define_bool_state(
           'computation. Logging is performed with `logging`. When this '
           'option is set, the log level is WARNING; otherwise the level is '
           'DEBUG.'))
+
+explain_cache_misses = define_bool_state(
+    name='jax_explain_cache_misses',
+    default=False,
+    help=('Each time there is a miss on one of the main caches (e.g. the '
+          'tracing cache), log an explanation.. Logging is performed with '
+          '`logging`. When this option is set, the log level is WARNING; '
+          'otherwise the level is DEBUG.'))
 
 log_checkpoint_residuals = define_bool_state(
     name='jax_log_checkpoint_residuals',
@@ -861,6 +878,16 @@ distributed_debug = define_bool_state(
     help=('Enable logging useful for debugging multi-process distributed '
           'computations. Logging is performed with `logging` at WARNING '
           'level.'))
+
+random_seed_offset = define_int_state(
+    name='jax_random_seed_offset',
+    default=0,
+    help=('Offset to all random seeds (e.g. argument to jax.random.key()).'),
+    update_global_hook=lambda val: _update_global_jit_state(
+        random_seed_offset=val),
+    update_thread_local_hook=lambda val: update_thread_local_jit_state(
+        random_seed_offset=val)
+)
 
 legacy_prng_key = define_enum_state(
     name='jax_legacy_prng_key',
@@ -937,6 +964,17 @@ persistent_cache_min_compile_time_secs = define_float_state(
           'persistent compilation cache. This threshold can be raised to '
           'decrease the number of entries written to the cache.'))
 
+persistent_cache_min_entry_size_bytes = define_int_state(
+    name='jax_persistent_cache_min_entry_size_bytes',
+    default=0,
+    help=('The minimum size (in bytes) of an entry that will be cached in the '
+          'persistent compilation cache: '
+          '* -1: disable the size restriction and prevent overrides. '
+          '* Leave at default (0) to allow for overrides. The override will '
+          '  typically ensure that the minimum size is optimal for the '
+          '  filesystem being used for the cache. '
+          '* > 0: the actual minimum size desired; no overrides.'))
+
 compilation_cache_include_metadata_in_key = define_bool_state(
     name='jax_compilation_cache_include_metadata_in_key',
     default=False,
@@ -961,19 +999,21 @@ hlo_source_file_canonicalization_regex = define_string_state(
 
 include_full_tracebacks_in_locations = define_bool_state(
     name='jax_include_full_tracebacks_in_locations',
-    default=False,
+    default=True,
     help=(
-        'Include full Python tracebacks in MLIR locations in IR emitted by JAX.'
+        'Include Python tracebacks in MLIR locations in IR emitted by JAX.'
     ),
 )
 
-use_original_compilation_cache_key_generation = define_bool_state(
-    name='jax_use_original_compilation_cache_key_generation',
-    default=False,
-    help="If true, use the original cache-key generation algorithm. This is "
-         "a transient flag; once the new cache-key generation algorithm is "
-         "deployed, this flag and the original cache-key generation algorithm "
-         "will be removed.")
+traceback_in_locations_limit = define_int_state(
+    name='jax_traceback_in_locations_limit',
+    default=10,
+    help=(
+        'Limit the number of frames at the Python traceback frames included in '
+        'MLIR locations. If set to the negative value, traceback will not be '
+        'limited.'
+    ),
+)
 
 enable_compilation_cache = define_bool_state(
     name='jax_enable_compilation_cache',

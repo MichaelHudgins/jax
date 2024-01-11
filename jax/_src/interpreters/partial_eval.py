@@ -20,8 +20,7 @@ from functools import partial
 import inspect
 import itertools as it
 import operator as op
-from typing import (Any, Callable, NamedTuple, Optional,
-                    Union)
+from typing import Any, Callable, NamedTuple, Union
 from weakref import ref
 
 import numpy as np
@@ -670,8 +669,9 @@ def abstract_eval_fun(fun, *avals, debug_info=None, **params):
   return avals_out
 
 
-JaxprTracerRecipe = Union['JaxprEqnRecipe', 'LambdaBinding', 'FreeVar',
-                          'ConstVar', Literal]
+JaxprTracerRecipe = Union[
+    'JaxprEqnRecipe', 'LambdaBinding', 'FreeVar', 'ConstVar', Literal,
+]
 
 class JaxprTracer(Tracer):
   __slots__ = ['pval', 'recipe']
@@ -1330,7 +1330,7 @@ def ensure_enum(case: bool | RematCases) -> RematCases:
 #  * a list of Var instances representing residuals to be added (i.e. to be
 #    plumbed as outputs of the 'known' side jaxpr and added as input binders to
 #    the 'unknown' jaxpr).
-PartialEvalCustomResult = tuple[Optional[JaxprEqn], Optional[JaxprEqn],
+PartialEvalCustomResult = tuple[Union[JaxprEqn, None], Union[JaxprEqn, None],
                                 Sequence[bool], Sequence[bool], list[Var]]
 PartialEvalCustomRule = Callable[
     [Callable[..., RematCases_], Sequence[bool], Sequence[bool], JaxprEqn],
@@ -1399,28 +1399,12 @@ def closed_call_partial_eval_custom_rule(
     eqn: JaxprEqn, *, res_aval: ResAvalUpdater = _default_res_aval_updater,
   ) -> tuple[JaxprEqn, JaxprEqn, Sequence[bool], Sequence[bool], list[Var]]:
   # TODO(sharadmv,mattjj): dedup this rule with call_partial_eval_custom_rule.
-  closed_jaxpr = eqn.params[jaxpr_param_name]
-  jaxpr_known_, jaxpr_staged_, unks_out, inst_out, num_res_val, num_res_ref = \
-      partial_eval_jaxpr_stateful(closed_jaxpr.jaxpr, unks_in, inst_in,
-                                  False, False, saveable)
+  dropvars = tuple(isinstance(v, DropVar) for v in eqn.outvars)
+  jaxpr_known, jaxpr_staged, unks_out, inst_out, num_res_ref, num_res_val, out_fwd = \
+      _closed_jaxpr_partial_eval_custom_cached(
+          eqn.params[jaxpr_param_name], (*unks_in,), (*inst_in,), dropvars, saveable)
   num_res = num_res_ref + num_res_val
-
-  # Compute which residual value outputs are also *undropped* primal outputs.
-  num_out_primals = len(jaxpr_known_.outvars) - num_res_val
-  out_vars, res_vars = split_list(jaxpr_known_.outvars, [num_out_primals])
   out_binders_known, _ = partition_list(unks_out, eqn.outvars)
-  idx_map = {id(v): i for i, (v, b) in enumerate(zip(out_vars, out_binders_known))
-             if type(b) is not DropVar}
-  out_fwd = [idx_map.get(id(v)) for v in res_vars]
-
-  # Prune jaxpr_known_ outputs by removing forwards.
-  jaxpr_known_ = prune_jaxpr_outputs(
-      jaxpr_known_, [True] * num_out_primals + [f is None for f in out_fwd])
-
-  # Forming these fresh ClosedJaxprs defeats caching, but caller handles caching
-  jaxpr_known = core.ClosedJaxpr(jaxpr_known_, closed_jaxpr.consts)
-  jaxpr_staged = core.ClosedJaxpr(jaxpr_staged_, closed_jaxpr.consts)
-
   ins_known, _ = partition_list(unks_in, eqn.invars)
   _, ins_staged = partition_list(inst_in, eqn.invars)
   _, out_binders_staged = partition_list(inst_out, eqn.outvars)
@@ -1451,6 +1435,33 @@ def closed_call_partial_eval_custom_rule(
               if type(x) is Var and not inst]
   new_vars = [*new_inst, *res_val_vars, *res_ref_binders]
   return eqn_known, eqn_staged, unks_out, inst_out, new_vars
+
+@weakref_lru_cache
+def _closed_jaxpr_partial_eval_custom_cached(
+    jaxpr: ClosedJaxpr, unks_in: tuple[bool, ...], inst_in: tuple[bool, ...],
+    dropvars: tuple[bool, ...], saveable: Callable
+    ) -> tuple[ClosedJaxpr, ClosedJaxpr, Sequence[bool], Sequence[bool],
+               int, int, Sequence[int | None]]:
+  jaxpr_known_, jaxpr_staged_, unks_out, inst_out, num_res_val, num_res_ref = \
+      partial_eval_jaxpr_stateful(jaxpr.jaxpr, unks_in, inst_in,
+                                  False, False, saveable)
+
+  # Compute which residual value outputs are also *undropped* primal outputs.
+  num_out_primals = len(jaxpr_known_.outvars) - num_res_val
+  out_vars, res_vars = split_list(jaxpr_known_.outvars, [num_out_primals])
+  out_dropvars_known, _ = partition_list(unks_out, dropvars)
+  idx_map = {id(v): i for i, (v, b) in enumerate(zip(out_vars, out_dropvars_known))
+             if not b}
+  out_fwd = [idx_map.get(id(v)) for v in res_vars]
+
+  # Prune jaxpr_known_ outputs by removing forwards.
+  jaxpr_known_ = prune_jaxpr_outputs(
+      jaxpr_known_, [True] * num_out_primals + [f is None for f in out_fwd])
+
+  jaxpr_known = core.ClosedJaxpr(jaxpr_known_, jaxpr.consts)
+  jaxpr_staged = core.ClosedJaxpr(jaxpr_staged_, jaxpr.consts)
+  return jaxpr_known, jaxpr_staged, unks_out, inst_out, num_res_ref, num_res_val, out_fwd
+
 
 partial_eval_jaxpr_custom_rules[core.call_p] = \
     partial(call_partial_eval_custom_rule, 'call_jaxpr',
@@ -1566,7 +1577,8 @@ def _dce_jaxpr(jaxpr: Jaxpr, used_outputs: tuple[bool, ...],
 
   return new_jaxpr, used_inputs
 
-DCERule = Callable[[list[bool], JaxprEqn], tuple[list[bool], Optional[JaxprEqn]]]
+DCERule = Callable[[list[bool], JaxprEqn],
+                   tuple[list[bool], Union[JaxprEqn, None]]]
 
 def _default_dce_rule(
     used_outs: list[bool], eqn: JaxprEqn
@@ -1594,17 +1606,23 @@ def dce_jaxpr_call_rule(used_outputs: list[bool], eqn: JaxprEqn
 dce_rules[core.call_p] = dce_jaxpr_call_rule
 
 
+@weakref_lru_cache
+def _cached_closed_call_dce(jaxpr_, used_outputs: tuple[bool, ...]
+                            ) -> tuple[core.ClosedJaxpr, list[bool]]:
+  jaxpr, consts = jaxpr_.jaxpr, jaxpr_.consts
+  new_jaxpr, used_inputs = dce_jaxpr(jaxpr, used_outputs)
+  return core.ClosedJaxpr(new_jaxpr, consts), used_inputs
+
 def dce_jaxpr_closed_call_rule(used_outputs: list[bool], eqn: JaxprEqn
                                ) -> tuple[list[bool], JaxprEqn]:
   # TODO(mattjj): de-duplicate with above rule?
   jaxpr_ = eqn.params['call_jaxpr']
-  jaxpr, consts = jaxpr_.jaxpr, jaxpr_.consts
-  new_jaxpr, used_inputs = dce_jaxpr(jaxpr, used_outputs)
-  new_params = dict(eqn.params, call_jaxpr=core.ClosedJaxpr(new_jaxpr, consts))
+  closed_jaxpr, used_inputs = _cached_closed_call_dce(jaxpr_, tuple(used_outputs))
+  new_params = dict(eqn.params, call_jaxpr=closed_jaxpr)
   new_eqn = new_jaxpr_eqn(
       [v for v, used in zip(eqn.invars, used_inputs) if used],
       [v for v, used in zip(eqn.outvars, used_outputs) if used],
-      eqn.primitive, new_params, new_jaxpr.effects, eqn.source_info)
+      eqn.primitive, new_params, closed_jaxpr.effects, eqn.source_info)
   return used_inputs, new_eqn
 dce_rules[core.closed_call_p] = dce_jaxpr_closed_call_rule
 
@@ -1844,12 +1862,16 @@ def _const_folding_and_forwarding(
                     jaxpr_effects, jaxpr.debug_info)
   return new_jaxpr, new_constvals
 
-ConstFoldRule = Callable[[list[Optional[Any]], JaxprEqn],
-                         tuple[list[Optional[Any]], Optional[JaxprEqn]]]
+ConstFoldRule = Callable[
+    [list[Union[Any, None]], JaxprEqn],
+    tuple[list[Union[Any, None]], Union[JaxprEqn, None]],
+]
 const_fold_rules: dict[Primitive, ConstFoldRule] = {}
 
-ForwardingRule = Callable[[JaxprEqn],
-                          tuple[list[Optional[Var]], Optional[JaxprEqn]]]
+ForwardingRule = Callable[
+    [JaxprEqn],
+    tuple[list[Union[Var, None]], Union[JaxprEqn, None]]
+]
 forwarding_rules: dict[Primitive, ForwardingRule] = {}
 
 
@@ -2377,8 +2399,12 @@ def trace_to_jaxpr_final2(
 
 
 AbstractedAxisName = Hashable
-AbstractedAxesSpec = Union[dict[int, AbstractedAxisName],
-                           tuple[AbstractedAxisName, ...]]
+AbstractedAxesSpec = Union[
+    dict[int, AbstractedAxisName],
+    tuple[AbstractedAxisName, ...],
+]
+
+
 def infer_lambda_input_type(
     axes_specs: Sequence[AbstractedAxesSpec] | None,
     args: Sequence[Any]

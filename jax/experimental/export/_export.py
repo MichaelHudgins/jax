@@ -15,24 +15,28 @@
 
 """
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 import copy
 import dataclasses
 import functools
 import itertools
 import re
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, TypeVar, Union
+import warnings
 
 from absl import logging
-
 import numpy as np
 
 import jax
 from jax import sharding
 
+from jax._src import ad_util
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
+from jax._src import dtypes
 from jax._src import effects
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
@@ -54,6 +58,20 @@ zip = util.safe_zip
 
 DType = Any
 Shape = jax._src.core.Shape
+# The values of input and output sharding from the lowering.
+LoweringSharding = Union[sharding.XLACompatibleSharding, pxla.UnspecifiedValue]
+
+# None means unspecified sharding
+Sharding = Union[xla_client.HloSharding, None]
+
+# See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#native-serialization-versions
+# for a description of the different versions.
+minimum_supported_serialization_version = 6
+maximum_supported_serialization_version = 9
+
+_VERSION_START_SUPPORT_SHAPE_ASSERTIONS = 7
+_VERSION_START_SUPPORT_EFFECTS_WITH_REAL_TOKENS = 9
+
 
 class DisabledSafetyCheck:
   """A safety check should be skipped on (de)serialization.
@@ -69,7 +87,7 @@ class DisabledSafetyCheck:
   _impl: str
 
   @classmethod
-  def platform(cls) -> "DisabledSafetyCheck":
+  def platform(cls) -> DisabledSafetyCheck:
     """Allows the execution platform to differ from the serialization platform.
 
     Has effect only on deserialization.
@@ -77,7 +95,7 @@ class DisabledSafetyCheck:
     return DisabledSafetyCheck("platform")
 
   @classmethod
-  def custom_call(cls, target_name: str) -> "DisabledSafetyCheck":
+  def custom_call(cls, target_name: str) -> DisabledSafetyCheck:
     """Allows the serialization of a call target not known to be stable.
 
     Has effect only on serialization.
@@ -87,7 +105,7 @@ class DisabledSafetyCheck:
     return DisabledSafetyCheck(f"custom_call:{target_name}")
 
   @classmethod
-  def shape_assertions(cls) -> "DisabledSafetyCheck":
+  def shape_assertions(cls) -> DisabledSafetyCheck:
     """Allows invocations with shapes that do not meet the constraints.
 
     Has effect on serialization (to suppress the generation of the assertions)
@@ -95,7 +113,7 @@ class DisabledSafetyCheck:
     """
     return DisabledSafetyCheck("shape_assertions")
 
-  def is_custom_call(self) -> Optional[str]:
+  def is_custom_call(self) -> str | None:
     """Returns the custom call target allowed by this directive."""
     m = re.match(r'custom_call:(.+)$', self._impl)
     return m.group(1) if m else None
@@ -114,19 +132,6 @@ class DisabledSafetyCheck:
   def __hash__(self) -> int:
     return hash(self._impl)
 
-# See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#native-serialization-versions
-# for a description of the different versions.
-minimum_supported_serialization_version = 6
-maximum_supported_serialization_version = 9
-
-_VERSION_START_SUPPORT_SHAPE_ASSERTIONS = 7
-_VERSION_START_SUPPORT_EFFECTS_WITH_REAL_TOKENS = 9
-
-# The values of input and output sharding from the lowering.
-LoweringSharding = Union[sharding.XLACompatibleSharding, pxla.UnspecifiedValue]
-
-# None means unspecified sharding
-Sharding = Optional[xla_client.HloSharding]
 
 @dataclasses.dataclass(frozen=True)
 class Exported:
@@ -156,7 +161,7 @@ class Exported:
     unordered_effects: the unordered effects present in the serialized module.
         This is present from serialization version 9.
     mlir_module_serialized: the serialized lowered VHLO module.
-    serialization_version: a version number for the serialized module.
+    mlir_module_serialization_version: a version number for the serialized module.
         See more versioning details at https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#native-serialization-versions.
     module_kept_var_idx: the sorted indices of the arguments among `in_avals` that
         must be passed to the module. The other arguments have been dropped
@@ -166,7 +171,7 @@ class Exported:
         variables, or due to inner calls of Exported modules that have
         dimension variables or platform index arguments. Such modules need
         shape refinement before XLA compilation.
-    disabled_checks: a list of descriptors of safety checks that have been
+    disabled_safety_checks: a list of descriptors of safety checks that have been
         disabled at export time. See docstring for `DisabledSafetyCheck`.
     _get_vjp: an optional function that takes the current exported function and
         returns the exported VJP function.
@@ -282,14 +287,14 @@ class Exported:
   lowering_platforms: tuple[str, ...]
   ordered_effects: tuple[effects.Effect, ...]
   unordered_effects: tuple[effects.Effect, ...]
-  disabled_checks: Sequence[DisabledSafetyCheck]
+  disabled_safety_checks: Sequence[DisabledSafetyCheck]
 
   mlir_module_serialized: bytes
-  serialization_version: int
+  mlir_module_serialization_version: int
   module_kept_var_idx: tuple[int, ...]
   uses_shape_polymorphism: bool
 
-  _get_vjp: Optional[Callable[["Exported"], "Exported"]]
+  _get_vjp: Callable[[Exported], Exported] | None
 
   def mlir_module(self) -> ir.Module:
     return xla_client._xla.mlir.deserialize_portable_artifact(self.mlir_module_serialized)
@@ -299,7 +304,10 @@ class Exported:
     # do not want the entire serialized module to end up in locations.
     return f"Exported(fun_name={self.fun_name}, ...)"
 
-  def vjp(self) -> "Exported":
+  def has_vjp(self) -> bool:
+    return self._get_vjp is not None
+
+  def vjp(self) -> Exported:
     """Gets the exported VJP.
 
     Returns None if not available, which can happen if the Exported has been
@@ -314,9 +322,9 @@ def default_lowering_platform() -> str:
   return xb.canonicalize_platform(jax.default_backend())
 
 def symbolic_shape(
-  shape_spec: Optional[str],
+  shape_spec: str | None,
   *,
-  like: Optional[Sequence[Optional[int]]] = None) -> Shape:
+  like: Sequence[int | None] | None = None) -> Shape:
   """Constructs a jax.ShapeDtypeStruct with polymorphic shapes.
 
   Args:
@@ -336,7 +344,7 @@ def symbolic_shape(
   """
   return shape_poly.symbolic_shape(shape_spec, like=like)
 
-def shape_and_dtype_jax_array(a) -> tuple[Sequence[Optional[int]], DType]:
+def shape_and_dtype_jax_array(a) -> tuple[Sequence[int | None], DType]:
   """Returns the shape and dtype of a jax.Array."""
   aval = core.raise_to_shaped(core.get_aval(a))
   return aval.shape, aval.dtype
@@ -402,7 +410,7 @@ def _keep_main_tokens(serialization_version: int) -> bool:
 
 def export(fun_jax: Callable,
            *,
-           lowering_platforms: Optional[Sequence[str]] = None,
+           lowering_platforms: Sequence[str] | None = None,
            disabled_checks: Sequence[DisabledSafetyCheck] = (),
            ) -> Callable[..., Exported]:
   """Exports native serialization for a JAX function.
@@ -496,7 +504,7 @@ def export(fun_jax: Callable,
       mlir_module_attrs["jax.uses_shape_polymorphism"] = (
           mlir.ir.BoolAttr.get(shape_poly_state.uses_dim_vars))
 
-    mlir_module_serialized = _serialize_module(mlir_module)
+    mlir_module_serialized = _module_to_bytecode(mlir_module)
 
     # Figure out the result types and shapes
     if "global_out_avals" in lowering.compile_args:
@@ -509,13 +517,12 @@ def export(fun_jax: Callable,
 
     # Log and then check the module.
     if logging.vlog_is_on(3):
-      mlir_module_text = mlir.module_to_string(mlir_module)
       logmsg = (f"version={version} "
                 f"lowering_platforms={actual_lowering_platforms} "
                 f"disabled_checks={disabled_checks}")
       logging.info("Lowered JAX module: %s\n", logmsg)
-      for l in mlir_module_text.splitlines():
-        logging.info(l)
+      if dumped_to := mlir.dump_module_to_file(mlir_module, "export"):
+        logging.info("Dumped the exported MLIR module to %s", dumped_to)
 
     _check_module(mlir_module,
                   allow_non_replicated_sharding=allow_non_replicated_sharding,
@@ -554,17 +561,17 @@ def export(fun_jax: Callable,
         lowering_platforms=actual_lowering_platforms,
         ordered_effects=ordered_effects,
         unordered_effects=unordered_effects,
-        disabled_checks=tuple(disabled_checks),
+        disabled_safety_checks=tuple(disabled_checks),
         mlir_module_serialized=mlir_module_serialized,
         module_kept_var_idx=module_kept_var_idx,
         uses_shape_polymorphism=shape_poly_state.uses_dim_vars,
-        serialization_version=version,  # type: ignore
+        mlir_module_serialization_version=version,  # type: ignore
         _get_vjp=lambda exported: _export_native_vjp(fun_jax, exported))
 
   return do_export
 
 
-def _serialize_module(module: ir.Module) -> bytes:
+def _module_to_bytecode(module: ir.Module) -> bytes:
   mlir_str = mlir.module_to_bytecode(module)
   if hlo.get_api_version() < 4:
     target_version = hlo.get_earliest_forward_compatible_version()
@@ -875,6 +882,7 @@ _CUSTOM_CALL_TARGETS_GUARANTEED_STABLE = {
     "shape_assertion",  # Used by shape_poly to evaluate assertions
 }
 
+check_sharding_pattern = re.compile(r"^({replicated}|{unknown shard_as.*}|"")$")
 
 def _check_module(mod: ir.Module, *,
                   allow_non_replicated_sharding: bool,
@@ -905,7 +913,7 @@ def _check_module(mod: ir.Module, *,
       except KeyError:
         pass
       else:
-        if ir.StringAttr(sharding).value not in ["{replicated}", ""]:
+        if not re.match(check_sharding_pattern, ir.StringAttr(sharding).value):
           raise ValueError(
               "Lowered function does not have a top-level pjit but it has"
               f" non-replicated sharding annotations, e.g., {op} at {loc}.\nSee"
@@ -963,10 +971,10 @@ def canonical_shardings(
     device_assignment: Sequence[jax.Device],
     in_shardings: Sequence[Sharding],
     out_shardings: Sequence[Sharding]
-    ) -> tuple[Union[pxla.UnspecifiedValue,
-                     Sequence[sharding.XLACompatibleSharding]],
-               Union[pxla.UnspecifiedValue,
-                     Sequence[sharding.XLACompatibleSharding]]]:
+    ) -> tuple[(pxla.UnspecifiedValue |
+                     Sequence[sharding.XLACompatibleSharding]),
+               (pxla.UnspecifiedValue |
+                     Sequence[sharding.XLACompatibleSharding])]:
   """Prepares canonical in_ and out_shardings for a pjit invocation.
 
   The pjit front-end is picky about what in- and out-shardings it accepts,
@@ -978,8 +986,8 @@ def canonical_shardings(
   """
   replicated_s = sharding.GSPMDSharding.get_replicated(device_assignment)
   def canonicalize(
-    ss: Sequence[Sharding]) -> Union[pxla.UnspecifiedValue,
-                                     Sequence[sharding.XLACompatibleSharding]]:
+    ss: Sequence[Sharding]) -> (pxla.UnspecifiedValue |
+                                     Sequence[sharding.XLACompatibleSharding]):
     if all(s is None for s in ss):
       return sharding_impls.UNSPECIFIED
     return tuple(
@@ -1042,11 +1050,11 @@ def _export_native_vjp(primal_fun, primal: Exported) -> Exported:
                                            apply_jit=True)
   return export(fun_vjp_jax,
                 lowering_platforms=primal.lowering_platforms,
-                disabled_checks=primal.disabled_checks)(*vjp_in_avals)
+                disabled_checks=primal.disabled_safety_checks)(*vjp_in_avals)
 
-### Importing
+### Calling the exported function
 
-def call_exported(exported: Exported) -> Callable[..., jax.Array]:
+def call(exported: Exported) -> Callable[..., jax.Array]:
   if not isinstance(exported, Exported):
     raise ValueError(
       "The exported argument must be an export.Exported. "
@@ -1063,7 +1071,16 @@ def call_exported(exported: Exported) -> Callable[..., jax.Array]:
   def f_flat_vjp_bwd(residual, ct_res_flat):
     args_flat = residual  # residual is the primal argument flat tuple
     exp_vjp = exported.vjp()
-    in_ct_flat = call_exported(exp_vjp)(*args_flat, *ct_res_flat)
+    # ct_res_flat may contain arrays of zeros where exp_vjp expect float0.
+    # We make the proper arrays of float0 to invoke exp_vjp.
+    def fix_float0_ct(ct_res, expected_aval):
+      if expected_aval.dtype != dtypes.float0:
+        return ct_res
+      return ad_util.zeros_like_aval(expected_aval)
+
+    ct_res_fixed = map(fix_float0_ct,
+                       ct_res_flat, exp_vjp.in_avals[len(args_flat):])
+    in_ct_flat = call_exported(exp_vjp)(*args_flat, *ct_res_fixed)
     return in_ct_flat
 
   f_flat.defvjp(f_flat_vjp_fwd, f_flat_vjp_bwd)
@@ -1092,6 +1109,7 @@ def call_exported(exported: Exported) -> Callable[..., jax.Array]:
     return exported.out_tree.unflatten(res_flat)
   return f_imported
 
+call_exported = call
 
 # A JAX primitive for invoking a serialized JAX function.
 call_exported_p = core.Primitive("call_exported")
@@ -1106,7 +1124,7 @@ def _call_exported_abstract_eval(
   assert len(in_avals) == len(exported.in_avals)  # since the pytrees have the same structure
   # Check that the expected shapes match the actual ones
   for arg_idx, (exp_aval, actual_aval) in enumerate(zip(exported.in_avals, in_avals)):
-    def pp_arg_dim(dim_idx: Optional[int]) -> str:
+    def pp_arg_dim(dim_idx: int | None) -> str:
       return shape_poly.pretty_print_dimension_descriptor(exported.in_tree,
                                                           arg_idx, dim_idx)
     if len(exp_aval.shape) != len(actual_aval.shape):
@@ -1215,7 +1233,7 @@ def _call_exported_lowering(ctx: mlir.LoweringRuleContext, *args,
     if platform in exported.lowering_platforms:
       callee_lowering_platform_index.append(
         exported.lowering_platforms.index(platform))
-    elif DisabledSafetyCheck.platform() in exported.disabled_checks:
+    elif DisabledSafetyCheck.platform() in exported.disabled_safety_checks:
       callee_lowering_platform_index.append(0)
     else:
       raise ValueError(
@@ -1249,7 +1267,7 @@ def _call_exported_lowering(ctx: mlir.LoweringRuleContext, *args,
   else:
     assert len(lowering_platforms) == 1
 
-  if _keep_main_tokens(exported.serialization_version):
+  if _keep_main_tokens(exported.mlir_module_serialization_version):
     ordered_effects = exported.ordered_effects
   else:
     ordered_effects = ()
@@ -1282,11 +1300,6 @@ def _call_exported_lowering(ctx: mlir.LoweringRuleContext, *args,
   )
   return results
 
-
-# for _p in ("cpu", "tpu", "cuda", "rocm"):
-#   mlir.register_lowering(call_exported_p,
-#                          functools.partial(_call_exported_lowering, platform=_p),
-#                          platform=_p)
 mlir.register_lowering(call_exported_p, _call_exported_lowering)
 
 def wrap_with_sharding(ctx: mlir.LoweringRuleContext,
@@ -1297,3 +1310,30 @@ def wrap_with_sharding(ctx: mlir.LoweringRuleContext,
     return x
   return mlir.wrap_with_sharding_op(
     ctx, x, x_aval, x_sharding.to_proto())
+
+# TODO(necula): Previously, we had `from jax.experimental.export import export`
+# Now we want to simplify the usage, and export the public APIs directly
+# from `jax.experimental.export` and now `jax.experimental.export.export`
+# refers to the `export` function. Since there may still be users of the
+# old API in other packages, we add the old public API as attributes of the
+# exported function. We will clean this up after a deprecation period.
+def wrap_with_deprecation_warning(f):
+  msg = (f"You are using function `{f.__name__}` from "
+         "`jax.experimental.export.export`. You should instead use it directly "
+         "from `jax.experimental.export`. Instead of "
+         "`from jax.experimental.export import export` you should use "
+         "`from jax.experimental import export`.")
+  def wrapped_f(*args, **kwargs):
+    warnings.warn(msg, DeprecationWarning)
+    return f(*args, **kwargs)
+  return wrapped_f
+
+export.export = wrap_with_deprecation_warning(export)
+export.Exported = Exported
+export.call_exported = wrap_with_deprecation_warning(call_exported)
+export.DisabledSafetyCheck = DisabledSafetyCheck
+export.default_lowering_platform = wrap_with_deprecation_warning(default_lowering_platform)
+export.symbolic_shape = wrap_with_deprecation_warning(symbolic_shape)
+export.args_specs = wrap_with_deprecation_warning(args_specs)
+export.minimum_supported_serialization_version = minimum_supported_serialization_version
+export.maximum_supported_serialization_version = maximum_supported_serialization_version

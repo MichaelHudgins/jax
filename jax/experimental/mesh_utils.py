@@ -14,6 +14,8 @@
 # ==============================================================================
 """Utils for building a device mesh."""
 
+from __future__ import annotations
+
 import collections
 from collections.abc import Sequence
 import itertools
@@ -95,7 +97,7 @@ def _tpu_v2_v3_create_device_mesh(
 # return None; in that case, it will fall back to using the default logic.
 device_kind_handler_dict: dict[
     str,
-    Callable[..., Optional[np.ndarray]],
+    Callable[..., np.ndarray | None],
 ] = {
     _TPU_V2: _tpu_v2_v3_create_device_mesh,
     _TPU_V3: _tpu_v2_v3_create_device_mesh,
@@ -269,7 +271,7 @@ def _transpose_trick(physical_mesh: np.ndarray,
 
 def create_device_mesh(
     mesh_shape: Sequence[int],
-    devices: Optional[Sequence[Any]] = None, *,
+    devices: Sequence[Any] | None = None, *,
     contiguous_submeshes: bool = False) -> np.ndarray:
   """Creates a performant device mesh for jax.sharding.Mesh.
 
@@ -321,10 +323,13 @@ def create_device_mesh(
     device_mesh = np.asarray(devices).reshape(mesh_shape)
     return device_mesh
 
-def create_hybrid_device_mesh(mesh_shape: Sequence[int],
-                              dcn_mesh_shape: Sequence[int],
-                              devices: Optional[Sequence[Any]] = None, *,
-                              process_is_granule: bool = False) -> np.ndarray:
+def create_hybrid_device_mesh(
+    mesh_shape: Sequence[int],
+    dcn_mesh_shape: Sequence[int],
+    devices: Sequence[Any] | None = None, *,
+    process_is_granule: bool = False,
+    should_sort_granules_by_key: bool = True,
+) -> np.ndarray:
   """Creates a device mesh for hybrid (e.g., ICI and DCN) parallelism.
 
   Args:
@@ -339,6 +344,9 @@ def create_hybrid_device_mesh(mesh_shape: Sequence[int],
       of the slower/outer network. Otherwise it will look for slice_index
       attributes on devices and use slices as the units. Enabling this is meant
       as a fallback for platforms (e.g., GPU) that don't set slice_index.
+    should_sort_granules_by_key: Whether device granules should be sorted by the
+      granule key, either slice or process index, depending on
+      process_is_granule.
 
   Raises:
     ValueError: if the number of slices to which the `devices` belong doesn't
@@ -356,7 +364,10 @@ def create_hybrid_device_mesh(mesh_shape: Sequence[int],
   granule_dict = collections.defaultdict(list)
   for dev in devices:
     granule_dict[getattr(dev, attr)].append(dev)
-  granules = [granule_dict[key] for key in sorted(granule_dict.keys())]
+  granules = (
+      [granule_dict[key] for key in sorted(granule_dict.keys())]
+      if should_sort_granules_by_key
+      else granule_dict.values())
   if np.prod(dcn_mesh_shape) != len(granules):
     raise ValueError(
         f'Number of slices {len(granules)} must equal the product of '

@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax
+from __future__ import annotations
+
 import inspect
 from typing import Optional
+import weakref
+
+import jax
 from jax._src import core
 from jax import tree_util
 from jax._src import linear_util as lu
@@ -29,10 +33,7 @@ from jax._src.interpreters import partial_eval as pe
 from jax._src.sharding_impls import _op_sharding_to_pos_sharding
 from jax._src import custom_api_util
 from jax._src.lib import xla_client as xc
-from jax._src.api_util import flatten_fun_nokwargs
-from jax._src.api_util import argnums_partial
-
-import weakref
+from jax._src.api_util import flatten_fun_nokwargs, argnums_partial
 
 
 def _resolve_kwargs(fun, args, kwargs):
@@ -382,7 +383,7 @@ class custom_partitioning:
         -1.6937828  +0.8402481j  15.999859   -4.0156755j]]
 
     Because of the logic in ``supported_sharding``, ``my_fft`` also works on 1-dimensional arrays.
-    However, in this case, the HLO of ``my_fft`` does show a a dynamic-slice, since the last dimension
+    However, in this case, the HLO of ``my_fft`` does show a dynamic-slice, since the last dimension
     is the dimension along which FFTs are calculated and needs to be replicated on all devices before
     the computation can be done.
 
@@ -479,6 +480,9 @@ def _custom_partitioning_lowering_rule(ctx: mlir.LoweringRuleContext, *values,
                                        static_args):
   mesh = mesh_lib.thread_resources.env.physical_mesh
   axis_context = ctx.module_context.axis_context
+  if (isinstance(axis_context, sharding_impls.SPMDAxisContext) and
+      set(axis_context.manual_axes) == set(axis_context.mesh.axis_names)):
+    return mlir.lower_fun(core.jaxpr_as_fun(call), multiple_results=True)(ctx, *values)
 
   if isinstance(axis_context, sharding_impls.ShardingContext):
     devices = axis_context.device_assignment
@@ -494,7 +498,7 @@ def _custom_partitioning_lowering_rule(ctx: mlir.LoweringRuleContext, *values,
     return mlir.lower_fun(
         core.jaxpr_as_fun(call), multiple_results=True)(ctx, *values)
 
-  def to_mesh_pspec_sharding(hlo_sharding: Optional[xc.HloSharding], ndim):
+  def to_mesh_pspec_sharding(hlo_sharding: xc.HloSharding | None, ndim):
     if hlo_sharding is None:
       return hlo_sharding
     if mesh.empty or not decode_shardings:

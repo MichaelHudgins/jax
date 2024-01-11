@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from functools import partial
 import math
 import operator
 from textwrap import dedent as _dedent
-from typing import Optional, Union, cast
+from typing import cast, NamedTuple
 
 import numpy as np
 
@@ -38,13 +40,6 @@ from jax._src.typing import Array, ArrayLike
 
 _lax_const = lax_internal._const
 
-
-@_wraps(np.in1d, lax_description="""
-In the JAX version, the `assume_unique` argument is not referenced.
-""")
-def in1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False, invert: bool = False) -> Array:
-  del assume_unique  # unused
-  return _in1d(ar1, ar2, invert)
 
 @partial(jit, static_argnames=('invert',))
 def _in1d(ar1: ArrayLike, ar2: ArrayLike, invert: bool) -> Array:
@@ -79,7 +74,7 @@ def _in1d(ar1: ArrayLike, ar2: ArrayLike, invert: bool) -> Array:
         When ``size`` is specified and there are fewer than the indicated number of elements, the
         remaining elements will be filled with ``fill_value``, which defaults to zero."""))
 def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
-              *, size: Optional[int] = None, fill_value: Optional[ArrayLike] = None) -> Array:
+              *, size: int | None = None, fill_value: ArrayLike | None = None) -> Array:
   check_arraylike("setdiff1d", ar1, ar2)
   if size is None:
     ar1 = core.concrete_or_error(None, ar1, "The error arose in setdiff1d()")
@@ -91,7 +86,7 @@ def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
     return full_like(arr1, fill_value, shape=size or 0)
   if not assume_unique:
     arr1 = cast(Array, unique(arr1, size=size and arr1.size))
-  mask = in1d(arr1, ar2, invert=True)
+  mask = _in1d(arr1, ar2, invert=True)
   if size is None:
     return arr1[mask]
   else:
@@ -117,7 +112,7 @@ def setdiff1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
         remaining elements will be filled with ``fill_value``, which defaults to the minimum
         value of the union."""))
 def union1d(ar1: ArrayLike, ar2: ArrayLike,
-            *, size: Optional[int] = None, fill_value: Optional[ArrayLike] = None) -> Array:
+            *, size: int | None = None, fill_value: ArrayLike | None = None) -> Array:
   check_arraylike("union1d", ar1, ar2)
   if size is None:
     ar1 = core.concrete_or_error(None, ar1, "The error arose in union1d()")
@@ -175,7 +170,7 @@ def _intersect1d_sorted_mask(ar1: ArrayLike, ar2: ArrayLike, return_indices: boo
 
 @_wraps(np.intersect1d)
 def intersect1d(ar1: ArrayLike, ar2: ArrayLike, assume_unique: bool = False,
-                return_indices: bool = False) -> Union[Array, tuple[Array, Array, Array]]:
+                return_indices: bool = False) -> Array | tuple[Array, Array, Array]:
   check_arraylike("intersect1d", ar1, ar2)
   ar1 = core.concrete_or_error(None, ar1, "The error arose in intersect1d()")
   ar2 = core.concrete_or_error(None, ar2, "The error arose in intersect1d()")
@@ -215,7 +210,9 @@ In the JAX version, the `assume_unique` argument is not referenced.
 """)
 def isin(element: ArrayLike, test_elements: ArrayLike,
          assume_unique: bool = False, invert: bool = False) -> Array:
-  result = in1d(element, test_elements, assume_unique=assume_unique, invert=invert)
+  del assume_unique  # unused
+  check_arraylike("isin", element, test_elements)
+  result = _in1d(element, test_elements, invert=invert)
   return result.reshape(np.shape(element))
 
 
@@ -225,8 +222,8 @@ UNIQUE_SIZE_HINT = (
   "To make jnp.unique() compatible with JIT and other transforms, you can specify "
   "a concrete value for the size argument, which will determine the output size.")
 
-@partial(jit, static_argnums=1)
-def _unique_sorted_mask(ar: Array, axis: int) -> tuple[Array, Array, Array]:
+@partial(jit, static_argnames=['axis', 'equal_nan'])
+def _unique_sorted_mask(ar: Array, axis: int, equal_nan: bool) -> tuple[Array, Array, Array]:
   aux = moveaxis(ar, axis, 0)
   if np.issubdtype(aux.dtype, np.complexfloating):
     # Work around issue in sorting of complex numbers with Nan only in the
@@ -241,7 +238,7 @@ def _unique_sorted_mask(ar: Array, axis: int) -> tuple[Array, Array, Array]:
     perm = lexsort(aux.reshape(size, math.prod(out_shape)).T[::-1])
   aux = aux[perm]
   if aux.size:
-    if dtypes.issubdtype(aux.dtype, np.inexact):
+    if dtypes.issubdtype(aux.dtype, np.inexact) and equal_nan:
       # This is appropriate for both float and complex due to the documented behavior of np.unique:
       # See https://github.com/numpy/numpy/blob/v1.22.0/numpy/lib/arraysetops.py#L212-L220
       neq = lambda x, y: lax.ne(x, y) & ~(isnan(x) & isnan(y))
@@ -253,9 +250,9 @@ def _unique_sorted_mask(ar: Array, axis: int) -> tuple[Array, Array, Array]:
   return aux, mask, perm
 
 def _unique(ar: Array, axis: int, return_index: bool = False, return_inverse: bool = False,
-            return_counts: bool = False, size: Optional[int] = None,
-            fill_value: Optional[ArrayLike] = None, return_true_size: bool = False
-            ) -> Union[Array, tuple[Array, ...]]:
+            return_counts: bool = False, equal_nan: bool = True, size: int | None = None,
+            fill_value: ArrayLike | None = None, return_true_size: bool = False
+            ) -> Array | tuple[Array, ...]:
   """
   Find the unique elements of an array along a particular axis.
   """
@@ -263,7 +260,7 @@ def _unique(ar: Array, axis: int, return_index: bool = False, return_inverse: bo
     raise ValueError(
       "jnp.unique: for zero-sized input with nonzero size argument, fill_value must be specified")
 
-  aux, mask, perm = _unique_sorted_mask(ar, axis)
+  aux, mask, perm = _unique_sorted_mask(ar, axis, equal_nan)
   if size is None:
     ind = core.concrete_or_error(None, mask,
         "The error arose in jnp.unique(). " + UNIQUE_SIZE_HINT)
@@ -325,8 +322,8 @@ def _unique(ar: Array, axis: int, return_index: bool = False, return_inverse: bo
         remaining elements will be filled with ``fill_value``. The default is the minimum value
         along the specified axis of the input."""))
 def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = False,
-           return_counts: bool = False, axis: Optional[int] = None,
-           *, size: Optional[int] = None, fill_value: Optional[ArrayLike] = None):
+           return_counts: bool = False, axis: int | None = None,
+           *, equal_nan: bool = True, size: int | None = None, fill_value: ArrayLike | None = None):
   check_arraylike("unique", ar)
   if size is None:
     ar = core.concrete_or_error(None, ar,
@@ -340,4 +337,51 @@ def unique(ar: ArrayLike, return_index: bool = False, return_inverse: bool = Fal
     arr = arr.flatten()
   axis_int: int = core.concrete_or_error(operator.index, axis, "axis argument of jnp.unique()")
   return _unique(arr, axis_int, return_index, return_inverse,
-                 return_counts, size=size, fill_value=fill_value)
+                 return_counts, equal_nan=equal_nan, size=size, fill_value=fill_value)
+
+
+class _UniqueAllResult(NamedTuple):
+  values: Array
+  indices: Array
+  inverse_indices: Array
+  counts: Array
+
+
+class _UniqueCountsResult(NamedTuple):
+    values: Array
+    counts: Array
+
+
+class _UniqueInverseResult(NamedTuple):
+    values: Array
+    inverse_indices: Array
+
+
+@_wraps(getattr(np, "unique_all", None))
+def unique_all(x: ArrayLike, /) -> _UniqueAllResult:
+  check_arraylike("unique_all", x)
+  values, indices, inverse_indices, counts = unique(
+    x, return_index=True, return_inverse=True, return_counts=True, equal_nan=False)
+  inverse_indices = inverse_indices.reshape(np.shape(x))
+  return _UniqueAllResult(values=values, indices=indices, inverse_indices=inverse_indices, counts=counts)
+
+
+@_wraps(getattr(np, "unique_counts", None))
+def unique_counts(x: ArrayLike, /) -> _UniqueCountsResult:
+  check_arraylike("unique_counts", x)
+  values, counts = unique(x, return_counts=True, equal_nan=False)
+  return _UniqueCountsResult(values=values, counts=counts)
+
+
+@_wraps(getattr(np, "unique_inverse", None))
+def unique_inverse(x: ArrayLike, /) -> _UniqueInverseResult:
+  check_arraylike("unique_inverse", x)
+  values, inverse_indices = unique(x, return_inverse=True, equal_nan=False)
+  inverse_indices = inverse_indices.reshape(np.shape(x))
+  return _UniqueInverseResult(values=values, inverse_indices=inverse_indices)
+
+
+@_wraps(getattr(np, "unique_values", None))
+def unique_values(x: ArrayLike, /) -> Array:
+  check_arraylike("unique_values", x)
+  return cast(Array, unique(x, equal_nan=False))

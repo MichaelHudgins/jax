@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
 import enum
 from functools import partial
 import itertools
 import typing
-from typing import Any, Optional
+from typing import Any
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -54,7 +55,7 @@ all_dtypes = default_dtypes + jtu.dtypes.boolean
 class IndexSpec(typing.NamedTuple):
   shape: tuple[int, ...]
   indexer: Any
-  out_shape: Optional[tuple[int, ...]] = None
+  out_shape: tuple[int, ...] | None = None
 
 
 def check_grads(f, args, order, atol=None, rtol=None, eps=None):
@@ -1444,7 +1445,7 @@ class IndexedUpdateTest(jtu.JaxTestCase):
     expected = jnp.array([5, 2, 3, 3])
     self.assertAllClose(ans, expected, check_dtypes=False)
 
-    # test with negative segment ids and without without explicit num_segments
+    # test with negative segment ids and without explicit num_segments
     # such as num_segments is defined by the smaller index.
     segment_ids = jnp.array([3, 3, 3, 4, 5, 5, -7, -6])
     ans = ops.segment_sum(data, segment_ids)

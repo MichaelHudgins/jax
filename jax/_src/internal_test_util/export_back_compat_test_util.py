@@ -65,13 +65,15 @@ then update `test_custom_call_coverage`, and then update your `test_foo_call`:
 
 """
 
+from __future__ import annotations
+
 from collections.abc import Iterable, Sequence
 import dataclasses
 import datetime
 import os
 import re
 import sys
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from absl import logging
 
@@ -81,7 +83,7 @@ from numpy import array, float32
 
 import jax
 from jax import tree_util
-from jax.experimental.export import export
+from jax.experimental import export
 
 from jax.experimental import pjit
 
@@ -163,12 +165,12 @@ class CompatTestBase(jtu.JaxTestCase):
 
   def run_one_test(self, func: Callable[..., jax.Array],
                    data: CompatTestData,
-                   polymorphic_shapes: Optional[Sequence[str]] = None,
-                   rtol: Optional[float] = None,
-                   atol: Optional[float] = None,
+                   polymorphic_shapes: Sequence[str] | None = None,
+                   rtol: float | None = None,
+                   atol: float | None = None,
                    allow_unstable_custom_call_targets: Sequence[str] = (),
-                   check_results: Optional[Callable[..., None]] = None,
-                   expect_current_custom_calls: Optional[Sequence[str]] = None):
+                   check_results: Callable[..., None] | None = None,
+                   expect_current_custom_calls: Sequence[str] | None = None):
     """Run one compatibility test.
 
     Args:
@@ -271,7 +273,7 @@ data_{datetime.date.today().strftime('%Y_%m_%d')} = dict(
 
   def serialize(self,
                 func: Callable, data: CompatTestData, *,
-                polymorphic_shapes: Optional[Sequence[str]] = None,
+                polymorphic_shapes: Sequence[str] | None = None,
                 allow_unstable_custom_call_targets: Sequence[str] = ()
                 ) -> tuple[bytes, str, int, int]:
     """Serializes the test function.
@@ -298,12 +300,12 @@ data_{datetime.date.today().strftime('%Y_%m_%d')} = dict(
 
     module_str = str(exported.mlir_module())
     serialized = exported.mlir_module_serialized
-    module_version = exported.serialization_version
+    module_version = exported.mlir_module_serialization_version
     nr_devices = exported.nr_devices
     return serialized, module_str, module_version, nr_devices
 
   def run_serialized(self, data: CompatTestData,
-                     polymorphic_shapes: Optional[Sequence[str]] = None):
+                     polymorphic_shapes: Sequence[str] | None = None):
     args_specs = export.args_specs(data.inputs, polymorphic_shapes)
     def ndarray_to_aval(a: np.ndarray) -> core.ShapedArray:
       return core.ShapedArray(a.shape, a.dtype)
@@ -330,9 +332,9 @@ data_{datetime.date.today().strftime('%Y_%m_%d')} = dict(
         lowering_platforms=(data.platform,),
         ordered_effects=(),
         unordered_effects=(),
-        disabled_checks=(),
+        disabled_safety_checks=(),
         mlir_module_serialized=data.mlir_module_serialized,
-        serialization_version=data.xla_call_module_version,
+        mlir_module_serialization_version=data.xla_call_module_version,
         nr_devices=data.nr_devices,
         module_kept_var_idx=tuple(range(len(in_avals))),
         uses_shape_polymorphism=any(not core.is_constant_shape(a.shape)

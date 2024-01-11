@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from functools import partial
 import itertools as it
-from typing import Any, Callable, NamedTuple, Optional, Union
+from typing import Any, Callable, NamedTuple, Union
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -54,15 +56,15 @@ class StatePrimitivesTest(jtu.JaxTestCase):
 
   def test_cant_eval_get_primitive(self):
     with self.assertRaises(ValueError):
-      get_p.bind(jnp.ones(5))
+      get_p.bind(jnp.ones(5), tree=None)
 
   def test_cant_eval_swap_primitive(self):
     with self.assertRaises(ValueError):
-      swap_p.bind(jnp.ones(5), jnp.zeros(5))
+      swap_p.bind(jnp.ones(5), jnp.zeros(5), tree=None)
 
   def test_cant_eval_addupdate_primitive(self):
     with self.assertRaises(ValueError):
-      addupdate_p.bind(jnp.ones(5), jnp.zeros(5))
+      addupdate_p.bind(jnp.ones(5), jnp.zeros(5), tree=None)
 
   def test_get_abstract_aval_must_take_in_refs(self):
     ref_aval = core.ShapedArray((), jnp.float32)
@@ -93,11 +95,37 @@ class StatePrimitivesTest(jtu.JaxTestCase):
            ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
            idx=(slice(None), np.array([0, 1]), slice(None), np.array([0, 1])),
            out_shape=(2, 1, 2), out_dtype=jnp.float32),
+      dict(testcase_name="get_with_nontrivial_slice",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(0, 1), np.array([0, 1]), slice(None), np.array([0, 1])),
+           out_shape=(2, 1, 2), out_dtype=jnp.float32),
+      dict(testcase_name="get_with_nontrivial_slice2",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(0, 1), slice(1, 3), slice(None), slice(None)),
+           out_shape=(1, 2, 2, 4), out_dtype=jnp.float32),
+      dict(testcase_name="get_with_ref_simple_at",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(1, 3), slice(None), slice(None)),
+           out_shape=(2, 2, 4), out_dtype=jnp.float32,
+           at_indices=((0,),)),
+      dict(testcase_name="get_with_ref_simple_at2",
+           ref_shape=(6, 1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(0, 2), slice(0, 1), slice(1, 3), slice(None), slice(None)),
+           out_shape=(2, 1, 2, 2, 4), out_dtype=jnp.float32,
+           at_indices=((slice(2, 6),),)),
+      dict(testcase_name="get_with_ref_multiple_at",
+           ref_shape=(1, 3, 5, 4), ref_dtype=jnp.float32,
+           idx=(slice(None), slice(None), slice(0, 2)),
+           out_shape=(3, 1, 2), out_dtype=jnp.float32,
+           at_indices=((0,), (slice(None), slice(0, 1)))),
   )
   def test_get_abstract_eval(self, ref_shape, ref_dtype, idx, out_shape=None,
-                             out_dtype=None, should_error=False):
+                             out_dtype=None, at_indices=(),
+                             should_error=False):
     ref_aval = AbstractRef(core.ShapedArray(ref_shape, ref_dtype))
     def f(x_ref):
+      for at_idx in at_indices:
+        x_ref = x_ref.at[at_idx]
       out = ref_get(x_ref, idx)
       return [out]
     if should_error:
@@ -158,13 +186,43 @@ class StatePrimitivesTest(jtu.JaxTestCase):
            val_shape=(2, 1, 2), val_dtype=jnp.float32,
            idx=(slice(None), np.array([0, 1]), slice(None), np.array([0, 1])),
            out_shape=(2, 1, 2), out_dtype=jnp.float32),
+      dict(testcase_name="swap_with_nontrivial_slice",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(0, 1), np.array([0, 1]), slice(None), np.array([0, 1])),
+           val_shape=(2, 1, 2), val_dtype=jnp.float32,
+           out_shape=(2, 1, 2), out_dtype=jnp.float32),
+      dict(testcase_name="swap_with_nontrivial_slice2",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(0, 1), slice(1, 3), slice(None), slice(None)),
+           val_shape=(1, 2, 2, 4), val_dtype=jnp.float32,
+           out_shape=(1, 2, 2, 4), out_dtype=jnp.float32),
+      dict(testcase_name="swap_with_ref_simple_at",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(0, 1), slice(1, 3), slice(None),),
+           val_shape=(1, 1, 4), val_dtype=jnp.float32,
+           out_shape=(1, 1, 4), out_dtype=jnp.float32,
+           at_indices=((0,),),),
+      dict(testcase_name="swap_with_ref_simple_at2",
+           ref_shape=(4, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(None), slice(0, 1), slice(1, 3), slice(None),),
+           val_shape=(2, 1, 1, 4), val_dtype=jnp.float32,
+           out_shape=(2, 1, 1, 4), out_dtype=jnp.float32,
+           at_indices=((slice(0, 2),),),),
+      dict(testcase_name="swap_with_ref_multiple_at2",
+           ref_shape=(1, 4, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(None), slice(0, 1), slice(1, 3), slice(None),),
+           val_shape=(2, 1, 1, 4), val_dtype=jnp.float32,
+           out_shape=(2, 1, 1, 4), out_dtype=jnp.float32,
+           at_indices=((slice(None), slice(0, 2),), (0,)),),
   )
   def test_swap_abstract_eval(self, ref_shape, ref_dtype,
       val_shape, val_dtype, idx, out_shape=None, out_dtype=None,
-      should_error=False):
+      at_indices=(), should_error=False):
     ref_aval = AbstractRef(core.ShapedArray(ref_shape, ref_dtype))
     val_aval = core.ShapedArray(val_shape, val_dtype)
     def f(x_ref, val):
+      for at_idx in at_indices:
+        x_ref = x_ref.at[at_idx]
       out = ref_swap(x_ref, idx, val)
       return [out]
     if should_error:
@@ -190,13 +248,13 @@ class StatePrimitivesTest(jtu.JaxTestCase):
            idx=(slice(None),), should_error=True),
       dict(testcase_name="trivial_addupdate", ref_shape=(1, 2),
            ref_dtype=jnp.float32, val_shape=(1, 2), val_dtype=jnp.float32,
-           idx=(), out_shape=(1, 2), out_dtype=jnp.float32),
+           idx=(),),
       dict(testcase_name="bad_dtype", ref_shape=(1, 2),
            ref_dtype=jnp.int32, val_shape=(1, 2), val_dtype=jnp.float32,
            idx=(), should_error=True),
       dict(testcase_name="addupdate_with_index", ref_shape=(1, 2),
            ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
-           idx=(0,), out_shape=(2,), out_dtype=jnp.float32),
+           idx=(0,),),
       dict(testcase_name="addupdate_with_nonleading_index", ref_shape=(1, 2),
            ref_dtype=jnp.float32, val_shape=(1,), val_dtype=jnp.float32,
            idx=(slice(None), 0)),
@@ -214,13 +272,34 @@ class StatePrimitivesTest(jtu.JaxTestCase):
            ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
            val_shape=(2, 1, 2), val_dtype=jnp.float32,
            idx=(slice(None), np.array([0, 1]), slice(None), np.array([0, 1]))),
+      dict(testcase_name="ref_with_simple_at",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 2), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]), slice(None), np.array([0, 1])),
+           at_indices=((0,),)),
+      dict(testcase_name="ref_with_simple_at2",
+           ref_shape=(3, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 3, 4), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]), slice(None), np.array([0, 1])),
+           at_indices=((slice(0, 3),),)),
+      dict(testcase_name="ref_with_multiple_at",
+           ref_shape=(3, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 2), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]), slice(None), np.array([0, 1])),
+           at_indices=((slice(0, 3),), (0,))),
+      dict(testcase_name="ref_with_multiple_at2",
+           ref_shape=(3, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 2), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]), slice(None), np.array([0, 1])),
+           at_indices=((slice(None), slice(0, 3),), (0,))),
   )
   def test_addupdate_abstract_eval(self, ref_shape, ref_dtype,
-      val_shape, val_dtype, idx, out_shape=None, out_dtype=None,
-      should_error=False):
+      val_shape, val_dtype, idx, at_indices=(), should_error=False):
     ref_aval = AbstractRef(core.ShapedArray(ref_shape, ref_dtype))
     val_aval = core.ShapedArray(val_shape, val_dtype)
     def f(x_ref, val):
+      for at_idx in at_indices:
+        x_ref = x_ref.at[at_idx]
       ref_addupdate(x_ref, idx, val)
       return []
     if should_error:
@@ -709,8 +788,8 @@ if CAN_USE_HYPOTHESIS:
 
   class VmappableIndexParam(NamedTuple):
     index_param: IndexParam
-    ref_bdim: Optional[int]
-    non_slice_idx_bdims: tuple[Optional[int], ...]
+    ref_bdim: int | None
+    non_slice_idx_bdims: tuple[int | None, ...]
     slice_bdim: int
     bat_ref_aval: shaped_array_ref
     bat_ref_shape: Shape
@@ -719,7 +798,7 @@ if CAN_USE_HYPOTHESIS:
     bat_slice_aval: core.ShapedArray
     bat_slice_shape: Shape
 
-  def maybe_tuple_insert(t: tuple[Any, ...], idx: Optional[int],
+  def maybe_tuple_insert(t: tuple[Any, ...], idx: int | None,
                          val: Any) -> tuple[Any, ...]:
     if idx is None:
       return t
@@ -815,12 +894,12 @@ if CAN_USE_HYPOTHESIS:
   Indexer = tuple[Union[int, slice, np.ndarray]]
 
   def _unpack_idx(idx: Indexer
-      ) -> tuple[Sequence[Union[int, np.ndarray]], Sequence[bool]]:
+      ) -> tuple[Sequence[int | np.ndarray], Sequence[bool]]:
     indexed_dims = [type(i) != slice for i in idx]
     non_slice_idx = [i for i, b in zip(idx, indexed_dims) if b]
     return non_slice_idx, indexed_dims
 
-  def _pack_idx(non_slice_idx: Sequence[Union[int, np.ndarray]],
+  def _pack_idx(non_slice_idx: Sequence[int | np.ndarray],
       indexed_dims: Sequence[bool]) -> Indexer:
     idx_ = iter(non_slice_idx)
     idx = tuple(next(idx_) if b else slice(None) for b in indexed_dims)
@@ -1593,7 +1672,6 @@ if CAN_USE_HYPOTHESIS:
     def test_vjp(self, data):
 
       spec = data.draw(func_spec())
-      print(spec)
 
       def impl(x):
         return spec.call((x, jnp.zeros_like(x)))[1]

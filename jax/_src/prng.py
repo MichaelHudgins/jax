@@ -19,7 +19,6 @@ from functools import partial, reduce
 import math
 import operator as op
 from typing import Any, Callable, NamedTuple
-import warnings
 
 import numpy as np
 
@@ -28,7 +27,6 @@ from jax import lax
 from jax import numpy as jnp
 from jax import tree_util
 
-from jax._src import ad_util
 from jax._src import api_util
 from jax._src import api
 from jax._src import basearray
@@ -309,13 +307,6 @@ class PRNGKeyArrayImpl(PRNGKeyArray):
   on_device_size_in_bytes = property(op.attrgetter('_base_array.on_device_size_in_bytes'))  # type: ignore[assignment]
   unsafe_buffer_pointer = property(op.attrgetter('_base_array.unsafe_buffer_pointer'))  # type: ignore[assignment]
 
-  def unsafe_raw_array(self):
-    # deprecated on 13 Sept 2023
-    raise warnings.warn(
-        'The `unsafe_raw_array` method of PRNG key arrays is deprecated. '
-        'Use `jax.random.key_data` instead.', DeprecationWarning, stacklevel=2)
-    return self._base_array
-
   def addressable_data(self, index: int) -> PRNGKeyArrayImpl:
     return PRNGKeyArrayImpl(self._impl, self._base_array.addressable_data(index))
 
@@ -409,7 +400,6 @@ _set_array_base_attributes(PRNGKeyArrayImpl, include=[
 basearray.Array.register(PRNGKeyArrayImpl)
 
 api_util._shaped_abstractify_handlers[PRNGKeyArrayImpl] = op.attrgetter('aval')
-ad_util.jaxval_zeros_likers[PRNGKeyArrayImpl] = jnp.zeros_like  # type: ignore[has-type]
 
 def prngkeyarrayimpl_flatten(x):
   return (x._base_array,), x._impl
@@ -471,23 +461,6 @@ class KeyTyRules:
     # TODO(frostig,mattjj,vanderplas,lenamartens): consider this consumed from
     # the outset.
     return random_wrap(key_data, impl=dtype._impl)
-
-  @staticmethod
-  def make_tangent(shape, dtype):
-    physical_shape = (*shape, *dtype._impl.key_shape)
-    def not_implemented(name):
-      def func(*args):
-        raise NotImplementedError(f"Cannot call {name} on tangent of PRNG key.")
-      return func
-    impl = PRNGImpl(
-      key_shape=dtype._impl.key_shape,
-      seed=not_implemented('seed'),
-      split=not_implemented('split'),
-      random_bits=not_implemented('random_bits'),
-      fold_in=not_implemented('fold_in'),
-      name=f"{dtype._impl.name}_tangent",
-      tag=f"{dtype._impl.tag}_t")
-    return random_wrap(jnp.zeros(physical_shape, dtype='uint32'), impl=impl)
 
   @staticmethod
   def physical_element_aval(dtype) -> core.ShapedArray:
@@ -610,19 +583,24 @@ class KeyTyRules:
     physical_result = pxla.batched_device_put(physical_aval, physical_sharding, [physical_buf] * len(devices), devices)
     return random_wrap(physical_result, impl=aval.dtype._impl)
 
+  @staticmethod
+  def tangent_dtype(_):
+    return dtypes.float0
 
-class KeyTangentTy(dtypes.ExtendedDType):
-  """A dtype to use for the tangent of a PRNGKey"""
-  _impl: PRNGImpl
-  type = dtypes.prng_key
+  # TODO(mattjj,frostig): even though the key dtype shouldn't appear in
+  # tangents, our ad.replace_float0s in custom_jvp/vjp means passing in zeros
+  # like the primal to user rules
+  @staticmethod
+  def zero(_):
+    return np.zeros((), dtypes.float0)
 
-  @property
-  def _rules(self):
-    raise ValueError("Cannot perform operations on the tangent of a PRNGKey.")
+  @staticmethod
+  def convert_from(key_dtype, other_dtype) -> bool:
+    return False
 
-  @property
-  def name(self) -> str:
-    return f'key_tangent<{self._impl.tag}>'
+  @staticmethod
+  def convert_to(other_dtype, key_dtype) -> bool:
+    return False
 
 
 class KeyTy(dtypes.ExtendedDType):
@@ -658,20 +636,11 @@ xla.pytype_aval_mappings[PRNGKeyArrayImpl] = lambda x: x.aval
 xla.canonicalize_dtype_handlers[PRNGKeyArrayImpl] = lambda x: x
 
 
-def key_array_shard_arg_handler(x: PRNGKeyArrayImpl, devices, indices, sharding):
-  aval = x.aval
-  key_shape = aval.dtype._impl.key_shape
+def key_array_shard_arg_handler(x: PRNGKeyArrayImpl, sharding):
   arr = x._base_array
-
-  # TODO(yashkatariya,frostig): This assumes that the last dimensions are not
-  # sharded. This is only true when enable_custom_prng is True.
-  trailing_inds = [slice(None)] * len(key_shape)
-  phys_indices = [(*inds, *trailing_inds) for inds in indices]
   phys_sharding = make_key_array_phys_sharding(
-      aval, sharding, is_sharding_from_xla=False)
-  return pxla.shard_arg_handlers[type(arr)](
-      arr, devices, phys_indices, phys_sharding
-  )
+      x.aval, sharding, is_sharding_from_xla=False)
+  return pxla.shard_arg_handlers[type(arr)](arr, phys_sharding)
 
 
 pxla.shard_arg_handlers[PRNGKeyArrayImpl] = key_array_shard_arg_handler
@@ -733,6 +702,8 @@ def random_seed(seeds: int | typing.ArrayLike, impl: PRNGImpl) -> PRNGKeyArrayIm
     seeds_arr = jnp.asarray(np.int64(seeds))
   else:
     seeds_arr = jnp.asarray(seeds)
+  if config.random_seed_offset.value:
+    seeds_arr += config.random_seed_offset.value
   return random_seed_p.bind(seeds_arr, impl=impl)
 
 random_seed_p = core.Primitive('random_seed')

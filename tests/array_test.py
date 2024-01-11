@@ -955,6 +955,15 @@ class ShardingTest(jtu.JaxTestCase):
       ("3d_mesh_none_y_none",      (2, 2, 2), P(None, 'y', None)),
       ("3d_mesh_x_y_none",         (2, 2, 2), P('x', 'y', None)),
       ("3d_mesh_none_yz",          (2, 2, 2), P(None, ('y', 'z'))),
+      ("3d_mesh_x_none_yz",        (2, 2, 2), P('x', None, ('y', 'z'))),
+      ("3d_mesh_none_x_yz",        (2, 2, 2), P(None, 'x', ('y', 'z'))),
+      ("3d_mesh_xy_z",             (2, 2, 2), P(('x', 'y'), 'z')),
+      ("3d_mesh_xy_none_z",        (2, 2, 2), P(('x', 'y'), None, 'z')),
+      ("3d_mesh_x_y_z",            (2, 2, 2), P('x', 'y', 'z')),
+      ("3d_mesh_xz_y",             (2, 2, 2), P(('x', 'z'), 'y')),
+      ("3d_mesh_xz_none_y",        (2, 2, 2), P(('x', 'z'), None, 'y')),
+      ("3d_mesh_y_none_xz",        (2, 2, 2), P('y', None, ('x', 'z'))),
+      ("3d_mesh_none_y_xz",        (2, 2, 2), P(None, 'y', ('x', 'z'))),
       ("3d_mesh2_none_none_z",     (1, 2, 4), P(None, None, 'z')),
       ("3d_mesh2_x_none_none",     (1, 2, 4), P('x', None, None)),
       ("3d_mesh_x_none_none",      (2, 1, 1), P('x', None, None)),
@@ -1027,6 +1036,13 @@ class ShardingTest(jtu.JaxTestCase):
     out = jax.pmap(lambda x: x)(jnp.arange(2.))
     str(out.sharding)  # doesn't crash
     repr(out.sharding)  # doesn't crash
+
+  def test_positional_sharding_repr(self):
+    if jax.device_count() < 2:
+      self.skipTest('Test needs >= 2 devices.')
+    s = jax.sharding.PositionalSharding(jax.devices()).reshape(jax.device_count(), 1)
+    repr(s)  # doesn't crash
+    str(s)  # doesn't crash
 
   @parameterized.named_parameters(
       ('sharded_dim_0', (4, 2), 0),

@@ -13,9 +13,10 @@
 # limitations under the License.
 from __future__ import annotations
 
-import collections
-from collections import namedtuple
-from collections.abc import Generator, Hashable, Iterable, Iterator, Sequence
+import collections  # noqa: F401
+from collections import Counter, defaultdict, deque, namedtuple
+from collections.abc import (Generator, Hashable, Iterable, Iterator, Sequence,
+                             MutableSet, MutableMapping)
 from contextlib import contextmanager
 from dataclasses import dataclass
 import functools
@@ -28,8 +29,8 @@ import operator
 from operator import attrgetter
 import threading
 import types
-from typing import (Any, Callable, ClassVar, DefaultDict, Generic, NamedTuple,
-                    TypeVar, Union, cast, overload)
+from typing import (Any, Callable, ClassVar, Generic, NamedTuple, TypeVar,
+                    cast, overload, Union)
 import warnings
 from weakref import ref
 
@@ -140,19 +141,58 @@ class Jaxpr:
             len(debug_info.result_paths) == len(outvars))
 
   def __str__(self):
-    return str(pp_jaxpr(self, JaxprPpContext(), JaxprPpSettings()))
+    return str(self.pretty_print())
+
   __repr__ = __str__
 
   def pretty_print(self, *, source_info=False, print_shapes=True,
                    custom_pp_eqn_rules=True, name_stack=False,
-                   print_effects: bool = False, **kw):
-    doc = pp_jaxpr(self, JaxprPpContext(),
-                   JaxprPpSettings(source_info=source_info,
-                                   print_shapes=print_shapes,
-                                   custom_pp_eqn_rules=custom_pp_eqn_rules,
-                                   name_stack=name_stack,
-                                   print_effects=print_effects))
-    return doc.format(**kw)
+                   print_effects: bool = False, **kwargs):
+    context = JaxprPpContext()
+    settings = JaxprPpSettings(
+        source_info=source_info,
+        print_shapes=print_shapes,
+        custom_pp_eqn_rules=custom_pp_eqn_rules,
+        name_stack=name_stack,
+        print_effects=print_effects)
+
+    # Compute how many times each jaxpr is used.
+    names = defaultdict[Jaxpr, str](lambda: "jaxpr")
+    jaxpr_counts = Counter[Jaxpr]()
+    s = deque([self])
+    while s:
+      jaxpr = s.popleft()
+      jaxpr_counts[jaxpr] += 1
+      for eqn in jaxpr.eqns:
+        # TODO(slebedev): Come up with a more elaborate heuristic for name=.
+        name = eqn.params.get("name")
+        if name is None:
+          s.extend(jaxprs_in_params(eqn.params))
+          continue
+        name = name.strip("<>")  # <lambda> -> lambda
+        for subjaxpr in jaxprs_in_params(eqn.params):
+          s.append(subjaxpr)
+          names.setdefault(subjaxpr, name)
+
+    # Pull jaxprs occurring more than once to the top-level, making sure
+    # that their names are unique.
+    docs = []
+    name_counts = Counter[str]()
+    for jaxpr, c in jaxpr_counts.items():
+      if c == 1:
+        continue
+      name = names[jaxpr]
+      if (count := name_counts[name]) > 0:
+        name_counts[name] += 1
+        name += str(count)
+        name_counts[name] += 1
+      else:
+        name_counts[name] += 1
+      docs.append(pp_top_level_jaxpr(name, jaxpr, context, settings))
+      context.used_names.add(name)
+      context.top_level_jaxprs[jaxpr] = name
+    docs.append(pp_jaxpr(self, context, settings))
+    return pp.concat(docs).format(**kwargs)
 
   def _repr_pretty_(self, p, cycle):
     return p.text(self.pretty_print(use_color=True))
@@ -168,7 +208,7 @@ class Jaxpr:
                  effects=effects, debug_info=debug_info)
 
 def join_effects(*effects: Effects) -> Effects:
-  return set.union(*effects) if effects else no_effects
+  return set().union(*effects) if effects else no_effects
 
 def jaxprs_in_params(params) -> Iterator[Jaxpr]:
   for val in params.values():
@@ -182,7 +222,6 @@ def jaxprs_in_params(params) -> Iterator[Jaxpr]:
 
 def subjaxprs(jaxpr: Jaxpr) -> Iterator[Jaxpr]:
   """Generator for all subjaxprs found in the params of jaxpr.eqns.
-
   Does not descend recursively into the found subjaxprs.
   """
   for eqn in jaxpr.eqns:
@@ -236,12 +275,15 @@ class ClosedJaxpr:
   def __repr__(self): return repr(self.jaxpr)
 
   def pretty_print(self, *, source_info=False, print_shapes=True,
-                   name_stack=False, custom_pp_eqn_rules=True, **kw):
-    settings = JaxprPpSettings(source_info=source_info,
-                               print_shapes=print_shapes, name_stack=name_stack,
-                               custom_pp_eqn_rules=custom_pp_eqn_rules)
-    return pp_jaxpr(self.jaxpr, JaxprPpContext(), settings).format(**kw)
-
+                   name_stack=False, custom_pp_eqn_rules=True,
+                   print_effects=False, **kwargs):
+    return self.jaxpr.pretty_print(
+        source_info=source_info,
+        print_shapes=print_shapes,
+        name_stack=name_stack,
+        custom_pp_eqn_rules=custom_pp_eqn_rules,
+        print_effects=print_effects,
+        **kwargs)
 
   def _repr_pretty_(self, p, cycle):
     return p.text(self.pretty_print(use_color=True))
@@ -312,7 +354,7 @@ class Var:
   def __repr__(self):
     return _encode_digits_alphabetic(self.count) + self.suffix
 
-def _encode_digits_alphabetic(n):
+def _encode_digits_alphabetic(n: int) -> str:
   if n == -1:
     return '*'
   s = ''
@@ -321,12 +363,12 @@ def _encode_digits_alphabetic(n):
     s = chr(97 + i % 26) + s
   return s
 
-def _jaxpr_vars(jaxpr):
+def _jaxpr_vars(jaxpr) -> Iterable[Var]:
   return it.chain(
       jaxpr.invars, jaxpr.constvars,
       (v for eqn in jaxpr.eqns for v in eqn.outvars))
 
-def gensym(jaxprs: Sequence[Jaxpr] | None = None,
+def gensym(jaxprs: Iterable[Jaxpr] | None = None,
            suffix: str = '') -> Callable[[AbstractValue], Var]:
   """Produce distinct variables, printed with the optional suffix.
 
@@ -1745,12 +1787,9 @@ class ConcreteArray(ShapedArray):
   _complex = concretization_function_error(complex, True)
 
 def primal_dtype_to_tangent_dtype(primal_dtype):
-  # TODO(frostig,mattjj): determines that all extended dtypes have
-  # float0 tangent type, which works fine for all our current
-  # extended dtype applications. We may some day want to delegate
-  # this decision to the dtype rules.
-  if (dtypes.issubdtype(primal_dtype, dtypes.extended) or
-      not dtypes.issubdtype(primal_dtype, np.inexact)):
+  if dtypes.issubdtype(primal_dtype, dtypes.extended):
+    return primal_dtype._rules.tangent_dtype(primal_dtype)  # type: ignore
+  elif not dtypes.issubdtype(primal_dtype, np.inexact):
     return dtypes.float0
   else:
     return primal_dtype
@@ -1872,7 +1911,7 @@ pytype_aval_mappings[DArray] = \
     lambda x: DConcreteArray(x._aval.shape, x._aval.dtype, x._aval.weak_type,
                              x._data)
 
-@dataclass(frozen=True, eq=True)
+@dataclass(frozen=True)
 class bint(dtypes.ExtendedDType):
   bound: int
 
@@ -2012,7 +2051,7 @@ def dilate_dim(d: DimSize, dilation: DimSize) -> DimSize:
   """
   if definitely_equal(dilation, 1):  # fast path
     return d
-  return non_negative_dim(1 + dilation * (d - 1))
+  return max_dim(1 + dilation * (d - 1), 0)
 
 def stride_dim(d: DimSize, window_size: DimSize, window_stride: DimSize) -> DimSize:
   """max(0, (d - window_size) // window_stride + 1)
@@ -2021,26 +2060,40 @@ def stride_dim(d: DimSize, window_size: DimSize, window_stride: DimSize) -> DimS
   We assume window_size >= 1 and window_stride >= 1.
   """
   # If d < window_size then (d - window_size) // window_stride < 0
-  return non_negative_dim((d - window_size) // window_stride + 1)
+  return max_dim((d - window_size) // window_stride + 1, 0)
 
+# TODO(necula): Deprecated Jan 2024, to be removed.
 def non_negative_dim(d: DimSize) -> DimSize:
   """max(d, 0)."""
-  if is_constant_dim(d):
-    return max(0, d)
-  assert is_symbolic_dim(d)
-  try:
-    d_ge_0 = (d >= 0)
-    return d if d_ge_0 else 0
-  except InconclusiveDimensionOperation:
-    return d.non_negative()  # type: ignore
+  return max_dim(d, 0)
 
 def min_dim(d1: DimSize, d2: DimSize) -> DimSize:
   """Like min(d1, d2) but for both constant and symbolic dimensions."""
-  return d1 - non_negative_dim(d1 - d2)
+  d1_is_constant = is_constant_dim(d1)
+  if d1_is_constant and is_constant_dim(d2):
+    return min(d1, d2)
+  try:
+    d2_ge_d1 = (d2 >= d1)
+    return d1 if d2_ge_d1 else d2
+  except InconclusiveDimensionOperation:
+    if d1_is_constant:
+      return d2.rmin(d1)  # type: ignore[union-attr]
+    else:
+      return d1.min(d2)  # type: ignore[union-attr]
 
 def max_dim(d1: DimSize, d2: DimSize) -> DimSize:
   """Like max(d1, d2) but for both constant and symbolic dimensions."""
-  return d1 + non_negative_dim(d2 - d1)
+  d1_is_constant = is_constant_dim(d1)
+  if d1_is_constant and is_constant_dim(d2):
+      return max(d1, d2)
+  try:
+    d1_ge_d2 = (d1 >= d2)
+    return d1 if d1_ge_d2 else d2
+  except InconclusiveDimensionOperation:
+    if d1_is_constant:
+      return d2.rmax(d1)  # type: ignore[union-attr]
+    else:
+      return d1.max(d2)  # type: ignore[union-attr]
 
 def dimension_as_value(d: DimSize):
   """Turns a dimension size into a JAX array.
@@ -2060,6 +2113,9 @@ def _canonicalize_dimension(dim: DimSize) -> DimSize:
   except TypeError as e:
     type_error = e
   if isinstance(dim, Tracer) and config.dynamic_shapes.value:
+    if not (dim.ndim == 0 and (dtypes.issubdtype(dim.dtype, np.integer)
+                               or isinstance(dim.dtype, bint))):
+      raise TypeError(f"Dimensions must be integer scalars; got {dim.ndim=} {dim.dtype=}")
     return dim
   elif (config.dynamic_shapes.value and isinstance(dim, DArray) and
         type(dim._aval.dtype) is bint and not dim._aval.shape):
@@ -2096,11 +2152,16 @@ def canonicalize_dim(d: DimSize, context: str="") -> DimSize:
   return canonicalize_shape((d,), context)[0]
 
 def _invalid_shape_error(shape: Shape, context: str=""):
-  msg = ("Shapes must be 1D sequences of concrete values of integer type, "
-         f"got {shape}.")
+  if config.dynamic_shapes.value:
+    msg = ("Shapes must be 1D sequences of integer scalars, "
+           f"got {shape}")
+  else:
+    msg = ("Shapes must be 1D sequences of concrete values of integer type, "
+           f"got {shape}.")
   if context:
     msg += f" {context}."
-  if any(isinstance(x, Tracer) and isinstance(get_aval(x), ShapedArray)
+  if not config.dynamic_shapes.value and any(
+         isinstance(x, Tracer) and isinstance(get_aval(x), ShapedArray)
          and not isinstance(get_aval(x), ConcreteArray) for x in shape):
     msg += ("\nIf using `jit`, try using `static_argnums` or applying `jit` to "
             "smaller subfunctions.")
@@ -2766,6 +2827,13 @@ def check_jaxpr(jaxpr: Jaxpr):
     msg = "\n\n".join([msg, "while checking jaxpr:", jaxpr_str])
     raise JaxprTypeError(msg) from None
 
+  # Run key reuse checker after validating jaxpr:
+  if config.enable_key_reuse_checks.value:
+    # Import here to avoid circular imports
+    from jax.experimental.key_reuse._core import check_key_reuse_jaxpr  # pytype: disable=import-error
+    check_key_reuse_jaxpr(jaxpr)
+
+
 def _check_jaxpr(
     ctx_factory: Callable[[], tuple[JaxprPpContext, JaxprPpSettings]],
     jaxpr: Jaxpr
@@ -3024,15 +3092,24 @@ class JaxprPpSettings(NamedTuple):
 # A JaxprPpContext allows us to globally uniquify variable names within nested
 # Jaxprs.
 class JaxprPpContext:
-  var_ids: DefaultDict[Var, int]
+  var_names: defaultdict[Var, str]
+  used_names: MutableSet[str]
+  top_level_jaxprs: MutableMapping[Jaxpr, str]
 
-  def __init__(self):
-    self.var_ids = collections.defaultdict(it.count().__next__, {})
+  def __init__(self) -> None:
+    self.top_level_jaxprs = {}
+    self.used_names = set()
+    fresh_names: Iterator[str] = (
+        name
+        for i in it.count()
+        if (name := _encode_digits_alphabetic(i)) not in self.used_names
+    )
+    self.var_names = defaultdict(fresh_names.__next__)
 
 
 def pp_var(v: Var, context: JaxprPpContext) -> str:
   if isinstance(v, (Literal, DropVar)): return str(v)
-  return f"{_encode_digits_alphabetic(context.var_ids[v])}{v.suffix}"
+  return f"{context.var_names[v]}{v.suffix}"
 
 def pp_aval(a: AbstractValue, context: JaxprPpContext) -> str:
   if isinstance(a, DShapedArray):
@@ -3156,9 +3233,30 @@ def pp_jaxpr_skeleton(jaxpr, eqns_fn, context: JaxprPpContext,
   ])) + pp.text(" }"))
 
 
-def pp_jaxpr(jaxpr, context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
+def pp_top_level_jaxpr(
+    name: str,
+    jaxpr: Jaxpr,
+    context: JaxprPpContext,
+    settings: JaxprPpSettings,
+) -> pp.Doc:
+  return pp.concat([
+      pp.text("let " + name + " = "),
+      pp_jaxpr(jaxpr, context, settings),
+      pp.text(" in"),
+      pp.brk(),
+  ])
+
+
+def pp_jaxpr(
+    jaxpr: Jaxpr,
+    context: JaxprPpContext,
+    settings: JaxprPpSettings,
+) -> pp.Doc:
+  if name := context.top_level_jaxprs.get(jaxpr):
+    return pp.text(name)
   eqns_fn = lambda: pp_eqns(jaxpr.eqns, context, settings)
   return pp_jaxpr_skeleton(jaxpr, eqns_fn, context, settings)
+
 
 def pp_jaxprs(jaxprs, context: JaxprPpContext, settings: JaxprPpSettings) -> pp.Doc:
   jaxprs = [j.jaxpr if isinstance(j, ClosedJaxpr) else j for j in jaxprs]

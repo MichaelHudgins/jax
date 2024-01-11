@@ -124,12 +124,8 @@ class RuntimeTokenSet(threading.local):
   def get_token_input(self, eff: core.Effect,
                       devices: list[Device]) -> jax.Array:
     tok = self.current_tokens.get(eff, np.zeros(0, np.bool_))
-    s = NamedSharding(pxla.Mesh(devices, axis_names=["dev"]),
-                      PartitionSpec([]))
     s = jax.sharding.GSPMDSharding.get_replicated(devices)
-    indices = tuple(
-        s.addressable_devices_indices_map(tok.shape).values())
-    sharded_tok = pxla.shard_args(devices, [indices], [s], [tok])[0]
+    sharded_tok = pxla.shard_args([s], [tok])[0]
     self.current_tokens[eff] = sharded_tok
     return sharded_tok
 
@@ -191,7 +187,6 @@ def should_tuple_args(num_args: int, platform: str) -> bool:
   else:
     return False
 
-@util.weakref_lru_cache
 def jaxpr_has_primitive(jaxpr: core.Jaxpr, prim_name: str) -> bool:
   """Whether there is a primitive given by user anywhere inside a Jaxpr."""
   for eqn in jaxpr.eqns:
@@ -207,7 +202,6 @@ def jaxpr_has_primitive(jaxpr: core.Jaxpr, prim_name: str) -> bool:
 # stablehlo is oblivious of physical devices.
 prim_requires_devices_during_lowering: set[core.Primitive] = set()
 
-@util.weakref_lru_cache
 def jaxpr_has_prim_requiring_devices(jaxpr: core.Jaxpr):
   for eqn in jaxpr.eqns:
     if eqn.primitive in prim_requires_devices_during_lowering:
@@ -333,8 +327,7 @@ def _check_special(name: str, dtype: np.dtype, buf: basearray.Array) -> None:
 
 def _put_x(x, s: Sharding, aval: core.AbstractValue, committed: bool):
   result_handler = pxla.global_aval_to_result_handler(aval, s, committed, False)
-  map_ = s.devices_indices_map(aval.shape)  # type: ignore
-  return result_handler(pxla.shard_arg(x, list(map_), list(map_.values()), s))
+  return result_handler(pxla.shard_arg(x, s))
 
 def _override_get_device_assignment(sharding, *args, **kwargs):
   da = sharding._device_assignment

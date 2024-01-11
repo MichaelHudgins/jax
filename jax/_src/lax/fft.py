@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from functools import partial
 import math
-from typing import Union
 
 import numpy as np
 
@@ -51,7 +52,7 @@ def _str_to_fft_type(s: str) -> xla_client.FftType:
     raise ValueError(f"Unknown FFT type '{s}'")
 
 @partial(jit, static_argnums=(1, 2))
-def fft(x, fft_type: Union[xla_client.FftType, str], fft_lengths: Sequence[int]):
+def fft(x, fft_type: xla_client.FftType | str, fft_lengths: Sequence[int]):
   if isinstance(fft_type, str):
     typ = _str_to_fft_type(fft_type)
   elif isinstance(fft_type, xla_client.FftType):
@@ -117,7 +118,7 @@ def _fft_lowering(ctx, x, *, fft_type, fft_lengths):
     raise NotImplementedError("Shape polymorphism for FFT with non-constant fft_length is not implemented for TPU and GPU")
   return [
       hlo.FftOp(x, hlo.FftTypeAttr.get(fft_type.name),
-                mlir.dense_int_elements(fft_lengths)).result
+                mlir.dense_int_array(fft_lengths)).result
   ]
 
 

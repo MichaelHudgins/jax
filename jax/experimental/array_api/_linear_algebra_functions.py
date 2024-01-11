@@ -47,7 +47,7 @@ def cross(x1, x2, /, *, axis=-1):
   """
   Returns the cross product of 3-element vectors.
   """
-  return jax.numpy.cross(x1, x2, axis=axis)
+  return jax.numpy.linalg.cross(x1, x2, axis=axis)
 
 def det(x, /):
   """
@@ -85,13 +85,13 @@ def inv(x, /):
 
 def matmul(x1, x2, /):
   """Computes the matrix product."""
-  return jax.numpy.matmul(x1, x2)
+  return jax.numpy.linalg.matmul(x1, x2)
 
 def matrix_norm(x, /, *, keepdims=False, ord='fro'):
   """
   Computes the matrix norm of a matrix (or a stack of matrices) x.
   """
-  return jax.numpy.linalg.norm(x, ord=ord, keepdims=keepdims, axis=(-1, -2))
+  return jax.numpy.linalg.matrix_norm(x, ord=ord, keepdims=keepdims)
 
 def matrix_power(x, n, /):
   """
@@ -107,15 +107,13 @@ def matrix_rank(x, /, *, rtol=None):
 
 def matrix_transpose(x, /):
   """Transposes a matrix (or a stack of matrices) x."""
-  if x.ndim < 2:
-    raise ValueError(f"matrix_transpose requres at least 2 dimensions; got {x.ndim=}")
-  return jax.lax.transpose(x, (*range(x.ndim - 2), x.ndim - 1, x.ndim - 2))
+  return jax.numpy.linalg.matrix_transpose(x)
 
 def outer(x1, x2, /):
   """
   Returns the outer product of two vectors x1 and x2.
   """
-  return jax.numpy.outer(x1, x2)
+  return jax.numpy.linalg.outer(x1, x2)
 
 def pinv(x, /, *, rtol=None):
   """
@@ -142,13 +140,10 @@ def solve(x1, x2, /):
   Returns the solution of a square system of linear equations with a unique solution.
   """
   if x2.ndim == 1:
-    x2 = x2.reshape(*x1.shape[:-2], *x2.shape, 1)
-    return jax.numpy.linalg.solve(x1, x2)[..., 0]
-  if x2.ndim > x1.ndim:
-    x1 = x1.reshape(*x2.shape[:-2], *x1.shape)
-  elif x1.ndim > x2.ndim:
-    x2 = x2.reshape(*x1.shape[:-2], *x2.shape)
-  return jax.numpy.linalg.solve(x1, x2)
+    signature = "(m,m),(m)->(m)"
+  else:
+    signature = "(m,m),(m,n)->(m,n)"
+  return jax.numpy.vectorize(jax.numpy.linalg.solve, signature=signature)(x1, x2)
 
 
 def svd(x, /, *, full_matrices=True):
@@ -162,11 +157,11 @@ def svdvals(x, /):
   """
   Returns the singular values of a matrix (or a stack of matrices) x.
   """
-  return jax.numpy.linalg.svd(x, compute_uv=False)
+  return jax.numpy.linalg.svdvals(x)
 
 def tensordot(x1, x2, /, *, axes=2):
   """Returns a tensor contraction of x1 and x2 over specific axes."""
-  return jax.numpy.tensordot(x1, x2, axes=axes)
+  return jax.numpy.linalg.tensordot(x1, x2, axes=axes)
 
 def trace(x, /, *, offset=0, dtype=None):
   """
@@ -177,16 +172,8 @@ def trace(x, /, *, offset=0, dtype=None):
 
 def vecdot(x1, x2, /, *, axis=-1):
   """Computes the (vector) dot product of two arrays."""
-  rank = max(x1.ndim, x2.ndim)
-  x1 = jax.lax.broadcast_to_rank(x1, rank)
-  x2 = jax.lax.broadcast_to_rank(x2, rank)
-  if x1.shape[axis] != x2.shape[axis]:
-    raise ValueError("x1 and x2 must have the same size along specified axis.")
-  x1, x2 = jax.numpy.broadcast_arrays(x1, x2)
-  x1 = jax.numpy.moveaxis(x1, axis, -1)
-  x2 = jax.numpy.moveaxis(x2, axis, -1)
-  return jax.numpy.matmul(x1[..., None, :], x2[..., None])[..., 0, 0]
+  return jax.numpy.linalg.vecdot(x1, x2, axis=axis)
 
 def vector_norm(x, /, *, axis=None, keepdims=False, ord=2):
   """Computes the vector norm of a vector (or batch of vectors) x."""
-  return jax.numpy.linalg.norm(x, axis=axis, keepdims=keepdims, ord=ord)
+  return jax.numpy.linalg.vector_norm(x, axis=axis, keepdims=keepdims, ord=ord)

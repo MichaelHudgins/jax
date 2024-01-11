@@ -2712,6 +2712,27 @@ class LaxTest(jtu.JaxTestCase):
 
     jax.hessian(f)(1.0)  # don't crash
 
+  def test_constant_folding_complex_to_real_scan_regression(self):
+    # regression test for github.com/google/jax/issues/19059
+    def g(hiddens):
+        hiddens_aug = jnp.vstack((hiddens[0], hiddens))
+        new_hiddens = hiddens_aug.copy()
+        diff = new_hiddens[:-1] - hiddens
+        diff = new_hiddens[:-1] - hiddens
+        out = jnp.trace(jnp.conj(diff).T @ diff).real
+        return jnp.array(out, dtype=jnp.complex64)
+
+
+    def _step(carry, arg):
+        primals, f_vjp = jax.vjp(
+            g,
+            jax.random.normal(jax.random.key(0), (9, 8), dtype=jnp.complex64),
+        )
+        out = f_vjp(np.array(1.0 + 0j, 'complex64'))[0]
+        return carry, carry
+
+    a, b = jax.lax.scan(_step, 0, jnp.arange(4, dtype=jnp.complex64))
+
 
 class LazyConstantTest(jtu.JaxTestCase):
   def _Check(self, make_const, expected):
@@ -3021,8 +3042,8 @@ class FooArray:
   size = property(lambda self: self.data.size // 2)
   ndim = property(lambda self: self.data.ndim - 1)
 
-def shard_foo_array_handler(x, devices, indices, sharding):
-  device, = devices
+def shard_foo_array_handler(x, sharding):
+  device, = sharding._addressable_device_assignment
   aval = core.raise_to_shaped(core.get_aval(x.data))
   return pxla.batched_device_put(
       aval, jax.sharding.SingleDeviceSharding(device), [x.data], [device])

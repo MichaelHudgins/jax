@@ -1,4 +1,4 @@
-# Copyright 2021 The JAX Authors.
+# Copyright 2024 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,17 +11,5 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""This is just a backwards-compatibility stub.
 
-The main functionality has been moved to jax.experimental.export.shape_poly
-"""
-
-# TODO(necula): Remove these stubs
-from jax.experimental.export.shape_poly import (
-    InconclusiveDimensionOperation,
-
-    # PolyShape used in tensorflowjs/converters/jax_conversion.py
-    PolyShape,
-    # is_poly_dim is used by maths/qec.
-    is_poly_dim,
-)
+"""High level APIs for working with the MLIR Triton dialect."""

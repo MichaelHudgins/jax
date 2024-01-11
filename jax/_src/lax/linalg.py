@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import inspect
 import functools
 from functools import partial
 import math
-from typing import cast, Any, Callable, Literal, Optional, TypeVar, Union, overload
+from typing import cast, Any, Callable, Literal, TypeVar, overload
 import warnings
 
 import numpy as np
@@ -167,7 +169,7 @@ def eigh(
     lower: bool = True,
     symmetrize_input: bool = True,
     sort_eigenvalues: bool = True,
-    subset_by_index: Optional[tuple[int, int]] = None,
+    subset_by_index: tuple[int, int] | None = None,
 ) -> tuple[Array, Array]:
   r"""Eigendecomposition of a Hermitian matrix.
 
@@ -303,11 +305,11 @@ def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: Literal[True]) 
 def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: Literal[False]) -> Array: ...
 
 @overload
-def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: bool = True) -> Union[Array, tuple[Array, Array, Array]]: ...
+def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: bool = True) -> Array | tuple[Array, Array, Array]: ...
 
 # TODO: Add `max_qdwh_iterations` to the function signature for TPU SVD.
 @_warn_on_positional_kwargs
-def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: bool = True) -> Union[Array, tuple[Array, Array, Array]]:
+def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: bool = True) -> Array | tuple[Array, Array, Array]:
   """Singular value decomposition.
 
   Returns the singular values if compute_uv is False, otherwise returns a triple
@@ -721,7 +723,7 @@ def _eigh_cpu_gpu_lowering(
   # Therefore, we cannot yet support dynamic non-batch dimensions.
   if not is_constant_shape(operand_aval.shape[-2:]):
     raise NotImplementedError(
-        "Shape polymorphism for for native lowering for eigh is implemented "
+        "Shape polymorphism for native lowering for eigh is implemented "
         f"only for the batch dimensions: {operand_aval.shape}")
 
   if not (subset_by_index is None or subset_by_index == (0, n)):
@@ -758,7 +760,7 @@ def _eigh_tpu_impl(x, *, lower, sort_eigenvalues, subset_by_index):
   if not is_constant_dim(m):
     # TODO: maybe we can relax the check below for shape polymorphism?
     raise NotImplementedError(
-        "Shape polymorphism for for native lowering for eigh is implemented "
+        "Shape polymorphism for native lowering for eigh is implemented "
         f"only for the batch dimensions: {x.shape}")
   if m <= termination_size and (
       subset_by_index is None or subset_by_index == (0, n)
@@ -1157,13 +1159,13 @@ def _lu_unblocked(a):
     else:
       magnitude = ufuncs.abs(a[:, k])
     i = jnp.argmax(jnp.where(m_idx >= k, magnitude, -jnp.inf))
-    pivot = pivot.at[k].set(i)
+    pivot = pivot.at[k].set(i.astype(pivot.dtype))
     a = a.at[[k, i],].set(a[[i, k],])
     perm = perm.at[[i, k],].set(perm[[k, i],])
 
     # a[k+1:, k] /= a[k, k], adapted for loop-invariant shapes
     x = a[k, k]
-    a = a.at[:, k].set(jnp.where(m_idx > k, a[:, k] / x, a[:, k]))
+    a = a.at[:, k].set(jnp.where((m_idx > k) & (x != 0), a[:, k] / x, a[:, k]))
 
     # a[k+1:, k+1:] -= jnp.outer(a[k+1:, k], a[k, k+1:])
     a = a - jnp.where((m_idx[:, None] > k) & (n_idx[None, :] > k),
@@ -2116,7 +2118,7 @@ def tridiagonal_solve(dl: Array, d: Array, du: Array, b: Array) -> Array:
 def schur(x: ArrayLike, *,
           compute_schur_vectors: bool = True,
           sort_eig_vals: bool = False,
-          select_callable: Optional[Callable[..., Any]] = None) -> tuple[Array, Array]:
+          select_callable: Callable[..., Any] | None = None) -> tuple[Array, Array]:
   return schur_p.bind(
       x,
       compute_schur_vectors=compute_schur_vectors,

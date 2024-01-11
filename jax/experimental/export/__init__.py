@@ -12,3 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
+from jax.experimental.export._export import (
+    minimum_supported_serialization_version,
+    maximum_supported_serialization_version,
+    Exported,
+    export,
+    call_exported,  # TODO: deprecate
+    call,
+    DisabledSafetyCheck,
+    default_lowering_platform,
+
+    args_specs,  # TODO: move to shape_poly
+)
+from jax.experimental.export.shape_poly import (
+    is_symbolic_dim,
+    symbolic_shape,
+)
+from jax.experimental.export.serialization import (
+    serialize,
+    deserialize,
+)

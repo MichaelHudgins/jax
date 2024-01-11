@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for the shape-polymorphic export."""
+
+from __future__ import annotations
+
 import enum
 from collections.abc import Sequence
 import itertools
 import math
-from typing import Any, Callable, Optional
+import os
+from typing import Any, Callable
 import unittest
 
 from absl import logging
@@ -29,11 +33,12 @@ import operator as op
 import re
 
 import jax
-from jax.experimental.export import export
+from jax.experimental import export
 from jax.experimental.export import shape_poly
 from jax.experimental import pjit
 from jax import lax
 import jax.numpy as jnp
+from jax import ops
 from jax import random
 from jax._src import config
 from jax._src import core
@@ -60,6 +65,7 @@ expect_error_associative_scan = (
 )
 
 
+@jtu.with_config(jax_enable_key_reuse_checks=False)
 class DimExprTest(jtu.JaxTestCase):
 
   class AssertionType(enum.Enum):
@@ -134,13 +140,44 @@ class DimExprTest(jtu.JaxTestCase):
           ("a + -1", a - 1),
           ("3 * a * mod(a + 2, b + 2)", 3 * a * ((a + 2) % (b + 2))),
           ("3 * floordiv(a + 2, b + 2) * 2", 3 * ((a + 2) // (b + 2)) * 2),
-          ("non_negative(a - 2)", core.non_negative_dim(a - 2)),
+          # Keep for backwards compatibility. We ought to be able to parse
+          # non_negative
+          ("non_negative(a - 2)", core.max_dim(a - 2, 0)),
+          ("max(a, b)", "build_inside"),
+          ("min(a, b)", "build_inside"),
   ]])
-  def test_parse_dim(self,
-                     dim_spec="-2 * a^2 * b + b^2",
-                     dim_poly=-2 * a * a * b + b * b):
+  def test_parse_dim(self, dim_spec, dim_poly):
+    if dim_spec == "non_negative(a - 2)":
+      dim_poly = core.non_negative_dim(DimExprTest.a - 2)
+    elif dim_spec == "max(a, b)":
+      dim_poly = core.max_dim(DimExprTest.a, DimExprTest.b)
+    elif dim_spec == "min(a, b)":
+      dim_poly = core.min_dim(DimExprTest.a, DimExprTest.b)
+
     self.assertEqual((dim_poly,), shape_poly.symbolic_shape(dim_spec))
     self.assertEqual((dim_poly,), shape_poly.symbolic_shape(str(dim_poly)))
+
+  @jtu.parameterized_filterable(
+      kwargs=[
+          dict(dim_spec=dim_spec)
+          for dim_spec in [
+              "b + a",
+              "b - a",
+              "b + 3*a",
+              "a*b + a^2 + b + a",
+              "mod(a, 4) + floordiv(a, 4) + a",
+              "2*a^2 - 3*a - 1",
+              "a^2 + 3*a - 1",
+              "-1*a + 3",
+              "-1*mod(a, 4) + 3",
+              "-2*a + 3",
+              "a*floordiv(b, 8)*mod(b, 4)",
+          ]
+      ]
+  )
+  def test_print_dim(self, *, dim_spec: str):
+    e, = shape_poly.symbolic_shape(dim_spec)
+    self.assertEqual(str(e), dim_spec)
 
   @jtu.parameterized_filterable(
     kwargs=[
@@ -228,12 +265,60 @@ class DimExprTest(jtu.JaxTestCase):
     self.assertTrue(core.definitely_equal(1, jnp.add(0, 1)))  # An Array
     self.assertFalse(core.definitely_equal(1, "a"))
 
-  def test_poly_bounds(self):
+  def test_atoms_ordering(self):
+    a, b = shape_poly.symbolic_shape("a, b")
+
+    self.assertTrue(a.to_atom() < b.to_atom())
+    self.assertFalse(a.to_atom() >= b.to_atom())
+    self.assertTrue(a.to_atom() <= b.to_atom())
+    self.assertTrue(a.to_atom() != b.to_atom())
+
+    self.assertTrue(a.to_atom() < (a % 4).to_atom())
+    self.assertFalse(a.to_atom() > (a % 4).to_atom())
+    # FLOORDIV comes before MON because we compare operations alphabetically
+    self.assertTrue((a // 4).to_atom() < (a % 4).to_atom())
+
+    self.assertEqual(hash((a // 4).to_atom()), hash((a // 4).to_atom()))
+
+  def test_monomial_ordering(self):
+    a, b = shape_poly.symbolic_shape("a, b")
+    self.assertTrue(a.to_monomial() < b.to_monomial())
+    self.assertTrue(a.to_monomial() <= b.to_monomial())
+    self.assertTrue(b.to_monomial() >= a.to_monomial())
+    self.assertTrue(b.to_monomial() > a.to_monomial())
+
+    self.assertTrue(((3 * b) // a).to_monomial() >= ((2 * b) // a).to_monomial())
+    self.assertTrue(((3 * b) // a).to_monomial() >= ((4 * a) // b).to_monomial())
+    self.assertTrue(a.to_monomial() < (a * a).to_monomial())
+    self.assertTrue(b.to_monomial() < (a * a).to_monomial())
+    self.assertTrue((a * a * b).to_monomial() < (a * b * b).to_monomial())
+    e1 = 2 + a * a * b + a * b * b + a * b + a * a + a + b
+
+    sorted_e1 = [shape_poly._DimExpr.from_monomial(m, m_count)
+                 for m, m_count in e1.monomials()]
+    self.assertSequenceEqual(sorted_e1,
+                             [a * b * b, a * a * b, a * b, a * a, b, a, 2])
+
+    e2 = a * (a // 4) + (a // 4) + b * (a // 4) + b * (a % 4) + a * a + b + 15
+    sorted_e2 = [shape_poly._DimExpr.from_monomial(m, m_count)
+                 for m, m_count in e2.monomials()]
+    self.assertSequenceEqual(sorted_e2,
+                             [b * (a % 4), b * (a // 4), a * (a // 4), a // 4,
+                              a * a, b, 15])
+
+    # This failed with a previous implementation of atom equality
+    self.assertNotEqual(shape_poly._DimMon.from_operation(shape_poly._DimAtom.NON_NEGATIVE,
+                                                          a - b - 1),
+                        shape_poly._DimMon.from_operation(shape_poly._DimAtom.NON_NEGATIVE,
+                                                          a - 2*b - 1))
+
+  def test_poly_bounds_arithmetic(self):
     a, b = shape_poly.symbolic_shape("a, b")
     bounded_le4 = 5 - a
     bounded_ge2 = b + 1
     bounded_ge0_le4 = a % 5
     self.assertEqual(a.bounds(), (1, np.inf))
+    self.assertEqual((- a).bounds(), (-np.inf, -1))
     self.assertEqual(bounded_le4.bounds(), (-np.inf, 4))
     self.assertEqual(bounded_ge2.bounds(), (2, np.inf))
     self.assertEqual(bounded_ge0_le4.bounds(), (0, 4))
@@ -260,6 +345,16 @@ class DimExprTest(jtu.JaxTestCase):
     self.assertEqual((a + 2 * b - a).bounds(), (2, np.inf))
     self.assertEqual((a + 2 * b - a).bounds(), (2, np.inf))
 
+  def test_poly_bounds_mod(self):
+    a, b = shape_poly.symbolic_shape("a, b")
+
+    self.assertEqual((5 - a % 5).bounds(), (1, 5))
+    self.assertEqual((-5 - a % (-5)).bounds(), (-5, -1))
+    self.assertEqual((a - 5 % a).bounds(), (1, np.inf))
+    self.assertEqual((a - 5 % a).bounds(), (1, np.inf))
+    self.assertEqual((3 * (a + b) - 5 % (3 * (a + b))).bounds(), (1, np.inf))
+    self.assertEqual((- a + (b - 5) % a).bounds(), (-np.inf, -1))
+
     # mod
     self.assertEqual(((b + 1) % 2).bounds(), (0, 1))
     self.assertEqual(((b + 1) % -2).bounds(), (-1, 0))
@@ -269,7 +364,12 @@ class DimExprTest(jtu.JaxTestCase):
     self.assertEqual((-11 % (a + 1)).bounds(), (0, np.inf))
     self.assertEqual((b % (a - 2)).bounds(), (-np.inf, np.inf))
 
-    # floordiv
+    # This arises in convolutions, because we use "-2 * div(-b, 2)" to get
+    # the "2*ceil(b / 2)".
+    self.assertGreaterEqual(-2 * ((- b) // 2), b)
+
+  def poly_bounds_div(self):
+    a, b = shape_poly.symbolic_shape("a, b")
     self.assertEqual(((a + 4) // 2).bounds(), (2, np.inf))
     self.assertEqual(((a + 4) // -2).bounds(), (-np.inf, -3))
     self.assertEqual(((a + 5) // 2).bounds(), (3, np.inf))
@@ -280,6 +380,8 @@ class DimExprTest(jtu.JaxTestCase):
     self.assertEqual(((b + 1) // (a + 1)).bounds(), (0, np.inf))
     self.assertEqual((-b // (a + 1)).bounds(), (-np.inf, -1))
 
+  def test_poly_bounds_div_generated(self):
+    a, b = shape_poly.symbolic_shape("a, b")
     # Generate test cases for floordiv and mod: (a + N) // +-2, (N - a) // +-2
     # and then evaluate them for a = 1, 5, 10000
     div_mod_atoms = [
@@ -297,19 +399,70 @@ class DimExprTest(jtu.JaxTestCase):
         self.assertGreaterEqual(atom_val, lb)
         self.assertLessEqual(atom_val, ub)
 
-    # Bounds involving mod and floordiv
-    self.assertEqual((5 - a % 5).bounds(), (1, 5))
-    self.assertEqual((-5 - a % (-5)).bounds(), (-5, -1))
-    self.assertEqual((a - 5 % a).bounds(), (1, np.inf))
-    self.assertEqual((a - 5 % a).bounds(), (1, np.inf))
-    self.assertEqual((3 * (a + b) - 5 % (3 * (a + b))).bounds(), (1, np.inf))
-    self.assertEqual((- a + (b - 5) % a).bounds(), (-np.inf, -1))
+  def test_poly_bounds_non_negative(self):
+    a, b = shape_poly.symbolic_shape("a, b")
 
-    # non_negative
     self.assertEqual(core.non_negative_dim(a).bounds(), (1, np.inf))
     self.assertEqual(core.non_negative_dim(a - 5).bounds(), (0, np.inf))
     self.assertEqual(core.non_negative_dim(15 - a).bounds(), (0, 14))
     self.assertEqual((core.non_negative_dim(15 - a) // 3).bounds(), (0, 4))
+
+  def test_min_dim(self):
+    a, b, c = shape_poly.symbolic_shape("a, b, c")
+
+    self.assertEqual(core.min_dim(a, b).bounds(), (1, np.inf))
+    self.assertEqual(core.min_dim(2, b).bounds(), (1, 2))
+    self.assertEqual(core.min_dim(a, -2), -2)
+    self.assertEqual(core.min_dim(a - 5, 1).bounds(), (-4, 1))
+    self.assertEqual(core.min_dim(15 - a, 10).bounds(), (-np.inf, 10))
+    self.assertEqual(core.min_dim(15 - a, 20).bounds(), (-np.inf, 14))
+
+    self.assertEqual(a, core.min_dim(a, a + 2))
+    self.assertEqual(a - 2, core.min_dim(a, a - 2))
+    self.assertGreaterEqual(a, core.min_dim(a, b))
+    self.assertGreaterEqual(a + c - 1, core.min_dim(a, b))
+    self.assertGreaterEqual(b, core.min_dim(a, b))
+    self.assertGreaterEqual(b + c - 1, core.min_dim(a, b))
+
+    self.sampled_assertion(core.min_dim(a, 5),
+                           core.min_dim, a, 5)
+    self.sampled_assertion(core.min_dim(5, a),
+                           core.min_dim, 5, a)
+  def test_max_dim(self):
+    a, b, c = shape_poly.symbolic_shape("a, b, c")
+
+    self.assertEqual(core.max_dim(a, b).bounds(), (1, np.inf))
+    self.assertEqual(core.max_dim(2, b).bounds(), (2, np.inf))
+    self.assertEqual(core.max_dim(a, 2).bounds(), (2, np.inf))
+    self.assertEqual(core.max_dim(a - 5, 1).bounds(), (1, np.inf))
+    self.assertEqual(core.max_dim(15 - a, 0).bounds(), (0, 14))
+    self.assertEqual((core.max_dim(15 - a, 0) // 3).bounds(), (0, 4))
+
+    self.assertEqual(a + 2, core.max_dim(a, a + 2))
+    self.assertEqual(a , core.max_dim(a, a - 2))
+    self.assertGreaterEqual(core.max_dim(a, b), a)
+    self.assertGreaterEqual(core.max_dim(a, b) + c - 1, a)
+    self.assertGreaterEqual(core.max_dim(a, b), b)
+    self.assertGreaterEqual(core.max_dim(a, b) + c - 1, b)
+
+    self.assertGreaterEqual(core.max_dim(a, b), core.min_dim(a, b))
+    self.sampled_assertion(core.max_dim(a, 5),
+                           core.max_dim, a, 5)
+    self.sampled_assertion(core.max_dim(5, a),
+                           core.max_dim, 5, a)
+
+  def test_clamp_dim(self):
+    a, b = shape_poly.symbolic_shape("a, b")
+    # Clamping b <= a <= b + 10
+    clamp = core.max_dim(core.min_dim(a, b + 10), b)
+    self.assertLessEqual(b, clamp)
+    self.assertLessEqual(clamp, b + 10)
+
+  def test_poly_bounds_complex(self):
+    a, b = shape_poly.symbolic_shape("a, b")
+    min_a_b = b - core.non_negative_dim(b - a)
+    # This comes up in slicing with stride
+    self.assertGreaterEqual(min_a_b // 2, 0)
 
   def test_poly_equal(self):
     a, b = shape_poly.symbolic_shape("a, b")
@@ -347,22 +500,14 @@ class DimExprTest(jtu.JaxTestCase):
                            a + (a + b) // b - (b + a) // b)
 
     # Test the normalization (a // b) * b == a - a % b
-    self.sampled_assertion((a // 2) * 2,
-                           lambda x: x, a - a % 2)
-    self.sampled_assertion((a // 2) + (a // 2),
-                           lambda x: x, a - a % 2)
-    self.sampled_assertion((a // 2) * 6,
-                           lambda x: x, 3 * a - 3 * (a % 2))
-    self.sampled_assertion((a // b) * b,
-                           lambda x: x, a - a % b)
-    self.sampled_assertion(2 * (a // b) * b * b,
-                           lambda x: x, 2 * b * a - 2 * b * (a % b))
-    self.sampled_assertion(a // (2 * b) * 2 * b,
-                           lambda x: x, a - a % (2 * b))
-    self.sampled_assertion(a // (2 * b) * 2 * b + 2 * a,
-                           lambda x: x, 3 * a - a % (2 * b))
-    self.sampled_assertion(a // (2 * b) * 2 * b + 2 * a,
-                           lambda x: x, 3 * a - a % (2 * b))
+    # We sacrifice this with a faster implementation of equality.
+    # We could fix this by adding: `core.expensive_eq()`
+    # self.sampled_assertion((a // 2) * 2,
+    #                        lambda x: x, a - a % 2)
+    # self.sampled_assertion((a // 2) + (a // 2),
+    #                        lambda x: x, a - a % 2)
+    # self.sampled_assertion((a // 2) * 6,
+    #                        lambda x: x, 3 * a - 3 * (a % 2))
 
   def test_poly_compare(self):
     a, b = shape_poly.symbolic_shape("a, b")
@@ -372,10 +517,18 @@ class DimExprTest(jtu.JaxTestCase):
     self.assertTrue(poly.ge(poly))
     self.assertTrue(poly.ge(poly - 1))
 
-    with self.assertRaisesRegex(core.InconclusiveDimensionOperation, "inconclusive"):
+    with self.assertRaisesRegex(
+        core.InconclusiveDimensionOperation,
+        re.escape("comparison 'b + 4*a + 3' >= '9' is inconclusive")):
       poly.ge(9)
 
-    with self.assertRaisesRegex(core.InconclusiveDimensionOperation, "inconclusive"):
+    with self.assertRaisesRegex(
+        core.InconclusiveDimensionOperation,
+        "comparison the_comp is inconclusive"):
+      poly.ge(9, lambda: "the_comp")
+
+    with self.assertRaisesRegex(core.InconclusiveDimensionOperation,
+                                "inconclusive"):
       (4 * a - b).ge(0)
 
   def test_poly_compare_overload(self):
@@ -432,7 +585,7 @@ class DimExprTest(jtu.JaxTestCase):
           (a * a - b * b, a + b, a - b, 0),
           (a, b, "floordiv(a, b)", "mod(a, b)"),
           (3 * a, 2, "floordiv(3*a, 2)", "mod(3*a, 2)"),
-          (2 * a * b + b * b, a + b, "floordiv(2*a*b + b^2, a + b)", "mod(2*a*b + b^2, a + b)"),
+          (2 * a * b + b * b, a + b, "floordiv(2*a*b + b^2, b + a)", "mod(2*a*b + b^2, b + a)"),
           (3, a, "floordiv(3, a)", "mod(3, a)"),
   ]])
   def test_poly_divmod(self, *, dividend, quotient, divisor, remainder):
@@ -456,35 +609,6 @@ class DimExprTest(jtu.JaxTestCase):
     self.sampled_assertion(core.non_negative_dim(a - 2),
                            core.non_negative_dim, a - 2)
 
-  def test_min_dim(self):
-    a, b, c = shape_poly.symbolic_shape("a, b, c")
-
-    self.assertEqual(a, core.min_dim(a, a + 2))
-    self.assertEqual(a - 2, core.min_dim(a, a - 2))
-    self.assertGreaterEqual(a, core.min_dim(a, b))
-    self.assertGreaterEqual(a + c - 1, core.min_dim(a, b))
-    self.assertGreaterEqual(b, core.min_dim(a, b))
-    self.assertGreaterEqual(b + c - 1, core.min_dim(a, b))
-
-  def test_max_dim(self):
-    a, b, c = shape_poly.symbolic_shape("a, b, c")
-
-    self.assertEqual(a + 2, core.max_dim(a, a + 2))
-    self.assertEqual(a , core.max_dim(a, a - 2))
-    self.assertGreaterEqual(core.max_dim(a, b), a)
-    self.assertGreaterEqual(core.max_dim(a, b) + c - 1, a)
-    self.assertGreaterEqual(core.max_dim(a, b), b)
-    self.assertGreaterEqual(core.max_dim(a, b) + c - 1, b)
-
-    self.assertGreaterEqual(core.max_dim(a, b), core.min_dim(a, b))
-
-  def test_clamp_dim(self):
-    a, b = shape_poly.symbolic_shape("a, b")
-    # Clamping b <= a <= b + 10
-    clamp = core.max_dim(core.min_dim(a, b + 10), b)
-    self.assertLessEqual(b, clamp)
-    self.assertLessEqual(clamp, b + 10)
-
   def test_dilate_dim(self):
     """0 if d == 0 else 1 + dilation * (d - 1))"""
     a, = shape_poly.symbolic_shape("a,")
@@ -494,7 +618,7 @@ class DimExprTest(jtu.JaxTestCase):
     self.sampled_assertion(0, core.dilate_dim, 0, 3)
     self.sampled_assertion(a, core.dilate_dim, a, 1)
     self.sampled_assertion(2 * a - 1, core.dilate_dim, a, 2)
-    self.sampled_assertion(core.non_negative_dim(2 * a - 3),
+    self.sampled_assertion(core.max_dim(2 * a - 3, 0),
                            core.dilate_dim, a - 1, 2)
 
   def test_stride_dim(self):
@@ -511,7 +635,7 @@ class DimExprTest(jtu.JaxTestCase):
     self.sampled_assertion(a - 1, core.stride_dim, a, 2, 1)
     self.sampled_assertion(a + 1, core.stride_dim, a * stride + 2, 2, stride)
     self.sampled_assertion((a - 1) // 2 + 1, core.stride_dim, a, 1, 2)
-    self.sampled_assertion(core.non_negative_dim((a - 4) // 2 + 1),
+    self.sampled_assertion(core.max_dim((a - 4) // 2 + 1, 0),
                            core.stride_dim, a, 4, 2)
 
 
@@ -526,10 +650,10 @@ class PolyHarness(Harness):
                fun: Callable[..., Any],
                *,
                arg_descriptors: Sequence[test_harnesses.ArgDescriptor] = (),
-               polymorphic_shapes: Sequence[Optional[str]] = (),
-               expect_error: Optional[tuple[Any, str]] = None,
+               polymorphic_shapes: Sequence[str | None] = (),
+               expect_error: tuple[Any, str] | None = None,
                check_result: bool = True,
-               tol: Optional[float] = None,
+               tol: float | None = None,
                limitations: Sequence[test_harnesses.Limitation] = (),
                override_jax_config_flags: dict[str, Any] = {}):
     """Args:
@@ -560,7 +684,7 @@ class PolyHarness(Harness):
     self.limitations = limitations
     self.override_jax_config_flags = override_jax_config_flags
 
-  def run_test(self, tst: jtu.JaxTestCase) -> Optional[jax.Array]:
+  def run_test(self, tst: jtu.JaxTestCase) -> jax.Array | None:
     def log_message(extra: str):
       return f"[{tst._testMethodName}]: {extra}"
 
@@ -612,8 +736,8 @@ class PolyHarness(Harness):
 
 def check_shape_poly(tst, f_jax: Callable, *,
                      arg_descriptors: Sequence[test_harnesses.ArgDescriptor] = (),
-                     polymorphic_shapes: Sequence[Optional[str]] = (),
-                     expect_error=None) -> Optional[jax.Array]:
+                     polymorphic_shapes: Sequence[str | None] = (),
+                     expect_error=None) -> jax.Array | None:
   # Builds a PolyHarness and runs the test. See PolyHarness documentation.
   h = PolyHarness("", "", f_jax,
                   arg_descriptors=arg_descriptors,
@@ -622,6 +746,7 @@ def check_shape_poly(tst, f_jax: Callable, *,
   return h.run_test(tst)
 
 
+@jtu.with_config(jax_enable_key_reuse_checks=False)
 class ShapePolyTest(jtu.JaxTestCase):
 
   def test_simple_unary(self):
@@ -1794,7 +1919,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
                                      RandArg((3, 4, 5), _f32)],
                     polymorphic_shapes=["b, ...", "b, w, ..."], tol=1E-5,
                     override_jax_config_flags=override_jax_config_flags),  # type: ignore
-        # The known dimensions product must be even.
+        # TODO(necula): The known dimensions product must be even.
         PolyHarness("random_categorical", f"axis=0_{flags_name}",
                     lambda key, a: jax.random.categorical(
                       jax.random.wrap_key_data(key), a, axis=0),
@@ -2077,6 +2202,27 @@ _POLY_SHAPE_TEST_HARNESSES = [
                                  ],
                 polymorphic_shapes=["b, ...", "b, ...", "b, ..."]),
     [
+      PolyHarness("segment", f"{name}_bucket_size_{bucket_size}",
+                  lambda x, segment_ids: op(
+                    x,  # f32[b, s, buckets]
+                    segment_ids,  # i32[b]
+                    num_segments=x.shape[1],
+                    bucket_size=(x.shape[2]
+                                 if bucket_size == "poly" else bucket_size)),
+                  arg_descriptors=[RandArg((8, 5, 2), _f32),
+                                   np.array([0, 0, 0, 1, 1, 3, 3, 3],
+                                            dtype=np.int32)
+                  ],
+                  polymorphic_shapes=["b, s, buckets", "b"])
+      for name, op in [
+        ("max", ops.segment_max),
+        ("min", ops.segment_min),
+        ("sum", ops.segment_sum),
+        ("prod", ops.segment_prod),
+      ]
+      for bucket_size in [None, 2, "poly"]
+    ],
+    [
       PolyHarness("schur",
                   f"shape={jtu.format_shape_dtype_string(shape, dtype)}_{poly=}_{compute_schur_vectors=}",
                   lambda a, compute_schur_vectors: lax.linalg.schur(
@@ -2288,7 +2434,7 @@ def _make_vmap_primitive_harnesses() -> Sequence[PolyHarness]:
       continue
 
     def make_batched_arg_descriptor(
-        ad: test_harnesses.ArgDescriptor) -> Optional[test_harnesses.ArgDescriptor]:
+        ad: test_harnesses.ArgDescriptor) -> test_harnesses.ArgDescriptor | None:
       if isinstance(ad, RandArg):
         return RandArg((batch_size,) + ad.shape, ad.dtype)
       elif isinstance(ad, CustomArg):
@@ -2329,8 +2475,26 @@ def _flatten_harnesses(harnesses):
   return res
 
 
+@jtu.with_config(jax_enable_key_reuse_checks=False)
 class ShapePolyHarnessesTest(jtu.JaxTestCase):
   """This test runs for all _POLY_SHAPE_PRIMITIVE_HARNESSES."""
+
+  def setUp(self):
+    self.prof = None
+    if os.getenv("JAX_PROFILE_TEST", False):
+      import cProfile
+      self.prof = cProfile.Profile()
+      self.prof.enable()
+    super().setUp()
+
+  def tearDown(self):
+    super().tearDown()
+    if self.prof is not None:
+      from pstats import Stats
+      p = Stats(self.prof)
+      p.strip_dirs()
+      p.sort_stats("cumtime").print_stats(.2)
+      p.print_callers(.2)
 
   # For each primitive "xxx" the test will be called "test_harness_xxx_...".
   # If you want to run this test for only one harness that includes "foo"

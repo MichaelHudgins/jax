@@ -17,13 +17,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-import io
-import itertools
 import time
 from typing import Any
 import logging
-import os
-import re
 import warnings
 
 import numpy as np
@@ -32,9 +28,10 @@ from jax._src import lib
 from jax._src import compilation_cache
 from jax._src import config as config
 from jax._src import monitoring
-from jax._src import path
 from jax._src import profiler
 from jax._src import traceback_util
+from jax._src.interpreters import mlir
+from jax._src.lib import xla_extension_version
 from jax._src.lib.mlir import ir
 from jax._src.lib import xla_client as xc
 
@@ -44,12 +41,6 @@ _DISABLE_MOST_OPTIMIZATIONS = config.DEFINE_bool(
     config.bool_env('JAX_DISABLE_MOST_OPTIMIZATIONS', False),
     'Try not to do much optimization work. This can be useful if the cost of '
     'optimization is greater than that of running a less-optimized program.')
-
-_DUMP_IR_TO = config.DEFINE_string(
-    'jax_dump_ir_to', os.getenv('JAX_DUMP_IR_TO', ''),
-    help="Path to which the IR that is emitted by JAX as input to the "
-         "compiler should be dumped as text files. Optional. If omitted, JAX "
-         "will not dump IR.")
 
 _COMPILER_DETAILED_LOGGING_MIN_OPS = config.DEFINE_integer(
     "jax_compiler_detailed_logging_min_ops",
@@ -218,18 +209,6 @@ def get_compile_options(
 
   return compile_options
 
-
-def _module_to_string(module: ir.Module) -> str:
-  output = io.StringIO()
-  module.operation.print(file=output, enable_debug_info=True)
-  return output.getvalue()
-
-def _module_to_bytecode(module: ir.Module) -> bytes:
-  output = io.BytesIO()
-  module.operation.write_bytecode(file=output)
-  return output.getvalue()
-
-
 @profiler.annotate_function
 def backend_compile(
     backend: xc.Client,
@@ -241,7 +220,7 @@ def backend_compile(
   # back-end expliclity flags the ability to handle a module directly
   # (avoiding the overhead of back and forth conversions)
   if getattr(backend, "needs_str_ir", True):
-    built_c = _module_to_bytecode(module)
+    built_c = mlir.module_to_bytecode(module)
   else:
     built_c = module
 
@@ -255,21 +234,6 @@ def backend_compile(
   # to take in `host_callbacks`
   return backend.compile(built_c, compile_options=options)
 
-
-_ir_dump_counter = itertools.count()
-
-def _make_string_safe_for_filename(s: str) -> str:
-  return re.sub(r'[^\w.)( -]', '', s)
-
-def _dump_ir_to_file(name: str, ir: str):
-  id = next(_ir_dump_counter)
-  name = f"jax_ir{id}_{_make_string_safe_for_filename(name)}.mlir"
-  out_dir = path.Path(_DUMP_IR_TO.value)
-  out_dir.mkdir(parents=True, exist_ok=True)
-  name = out_dir / name
-  name.write_text(ir)
-
-
 def compile_or_get_cached(
     backend: xc.Client,
     computation: ir.Module,
@@ -280,14 +244,13 @@ def compile_or_get_cached(
   sym_name = computation.operation.attributes['sym_name']
   module_name = ir.StringAttr(sym_name).value
 
-  if _DUMP_IR_TO.value:
-    _dump_ir_to_file(module_name, _module_to_string(computation))
+  if dumped_to := mlir.dump_module_to_file(computation, "compile"):
+    logging.info("Dumped the module to %s.", dumped_to)
 
   # Persistent compilation cache only implemented on TPU and GPU.
   # TODO(skye): add warning when initializing cache on unsupported default platform
   supported_platforms = ["tpu", "gpu"]
-  # (b/233850967) CPU caching can be enabled if XLA Runtime is enabled.
-  if "--xla_cpu_use_xla_runtime=true" in os.environ.get("XLA_FLAGS", ""):
+  if xla_extension_version >= 230:
     supported_platforms.append("cpu")
   use_compilation_cache = (compilation_cache.is_initialized() and
                            backend.platform in supported_platforms)
@@ -303,9 +266,7 @@ def compile_or_get_cached(
 
   try:
     cache_key = compilation_cache.get_cache_key(
-        computation, devices, compile_options, backend,
-        config.use_original_compilation_cache_key_generation.value,
-    )
+        computation, devices, compile_options, backend)
   except xc._xla.XlaRuntimeError as ex:
     logger.error("compile_or_get_cached: unable to generate cache key, "
                  "skipping the cache: %s", ex)
@@ -321,18 +282,10 @@ def compile_or_get_cached(
     assert retrieved_compile_time is not None
     logger.debug("Persistent compilation cache hit for '%s'", module_name)
 
-    if config.use_original_compilation_cache_key_generation.value:
-      # TODO(b/293308239) Remove metrics for the original cache after the new
-      # compilation cache key implementation is fully rolled out.
-      monitoring.record_event('/jax/compilation_cache/cache_hits_original')
-      monitoring.record_event_duration_secs(
-          "/jax/compilation_cache/original_compile_time_saved_sec",
-          retrieved_compile_time - cache_retrieval_time)
-    else:
-      monitoring.record_event('/jax/compilation_cache/cache_hits')
-      monitoring.record_event_duration_secs(
-          '/jax/compilation_cache/compile_time_saved_sec',
-          retrieved_compile_time - cache_retrieval_time)
+    monitoring.record_event('/jax/compilation_cache/cache_hits')
+    monitoring.record_event_duration_secs(
+        '/jax/compilation_cache/compile_time_saved_sec',
+        retrieved_compile_time - cache_retrieval_time)
 
     monitoring.record_event_duration_secs(
         "/jax/compilation_cache/cache_retrieval_time_sec", cache_retrieval_time)
@@ -396,9 +349,8 @@ def _cache_write(cache_key: str,
     return
   else:
     logger.debug(
-        "'%s' took at least %.2f seconds to compile (%.2fs), writing persistent"
-        " cache entry", module_name, min_compile_time, compile_time_secs)
-    monitoring.record_event('/jax/compilation_cache/cache_misses')
+        "'%s' took at least %.2f seconds to compile (%.2fs)",
+        module_name, min_compile_time, compile_time_secs)
 
   try:
     compilation_cache.put_executable_and_time(

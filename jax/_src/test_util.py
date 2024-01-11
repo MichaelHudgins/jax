@@ -135,7 +135,7 @@ def with_jax_dtype_defaults(func, use_defaults=True):
   Args:
     use_defaults : whether to convert any given output to the default dtype. May be
       a single boolean, in which case it specifies the conversion for all outputs,
-      or may be a a pytree with the same structure as the function output.
+      or may be a pytree with the same structure as the function output.
   """
   @functools.wraps(func)
   def wrapped(*args, **kwargs):
@@ -913,6 +913,7 @@ class JaxTestCase(parameterized.TestCase):
   """Base class for JAX tests including numerical checks and boilerplate."""
   _default_config = {
     'jax_enable_checks': True,
+    'jax_enable_key_reuse_checks': True,
     'jax_numpy_dtype_promotion': 'strict',
     'jax_numpy_rank_promotion': 'raise',
     'jax_traceback_filtering': 'off',
@@ -951,6 +952,7 @@ class JaxTestCase(parameterized.TestCase):
       stack.enter_context(config.enable_compilation_cache(True))
       stack.enter_context(config.raise_persistent_cache_errors(True))
       stack.enter_context(config.persistent_cache_min_compile_time_secs(0))
+      stack.enter_context(config.persistent_cache_min_entry_size_bytes(0))
 
       tmp_dir = stack.enter_context(tempfile.TemporaryDirectory())
       compilation_cache.initialize_cache(tmp_dir)
@@ -1368,3 +1370,13 @@ def fwd_bwd_jaxprs(f, *example_args):
       lambda *args: jax.vjp(f, *args), return_shape=True)(*example_args)
   bwd_jaxpr = jax.make_jaxpr(lambda res, outs: res(outs))(res_shape, y_shape)
   return fwd_jaxpr, bwd_jaxpr
+
+
+def numpy_vecdot(x, y, axis):
+  """Implementation of numpy.vecdot for testing on numpy < 2.0.0"""
+  if numpy_version() >= (2, 0, 0):
+    raise ValueError("should be calling vecdot directly on numpy 2.0.0")
+  x = np.moveaxis(x, axis, -1)
+  y = np.moveaxis(y, axis, -1)
+  x, y = np.broadcast_arrays(x, y)
+  return np.matmul(np.conj(x[..., None, :]), y[..., None])[..., 0, 0]

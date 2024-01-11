@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 import threading
-from typing import Optional
 import zlib
 
 import numpy as np
@@ -27,7 +28,8 @@ except ImportError:
 
 from jax._src import cache_key
 from jax._src.compilation_cache_interface import CacheInterface
-from jax._src.config import config
+from jax._src import config
+from jax._src import monitoring
 from jax._src.gfile_cache import GFileCache
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
@@ -35,7 +37,7 @@ from jax._src.lib.mlir import ir
 
 logger = logging.getLogger(__name__)
 
-_cache: Optional[CacheInterface] = None
+_cache: CacheInterface | None = None
 
 _cache_initialized: bool = False
 
@@ -43,7 +45,6 @@ _cache_used: bool = False
 
 # Mutex to protect _cache_initialized and _cache_used.
 _cache_initialized_mutex = threading.Lock()
-
 
 
 def set_once_cache_used(f) -> None:
@@ -70,11 +71,16 @@ def initialize_cache(path) -> None:
   Set the path. To take effect, should be called prior to any calls to
   get_executable_and_time() and put_executable_and_time().
   """
-  config.update("jax_compilation_cache_dir", path)
+  config.config.update("jax_compilation_cache_dir", path)
+
+
+def default_min_cache_entry_size() -> int:
+  """Returns the minimum size below which the entry should not be cached."""
+  return 0
 
 
 def _is_cache_enabled() -> bool:
-  return config.jax_enable_compilation_cache
+  return config.enable_compilation_cache.value
 
 
 def _initialize_cache() -> None:
@@ -91,9 +97,15 @@ def _initialize_cache() -> None:
       logger.debug("_initialize_cache: cache is disabled!")
       return
 
+    # Set the minimum cache size entry only if the flag
+    # --jax_persistent_cache_min_entry_size_bytes has not been set.
+    if config.persistent_cache_min_entry_size_bytes.value == 0:
+      config.config.update("jax_persistent_cache_min_entry_size_bytes",
+                           default_min_cache_entry_size())
+
     global _cache
     assert _cache is None, "The cache has already been initialized!"
-    path: str = config.jax_compilation_cache_dir
+    path: str = config.compilation_cache_dir.value
     # If the path is not set, the cache will not be enabled.
     if not path:
       return
@@ -102,7 +114,7 @@ def _initialize_cache() -> None:
     logger.debug("Initialized persistent compilation cache at %s", path)
 
 
-def _get_cache() -> Optional[CacheInterface]:
+def _get_cache() -> CacheInterface | None:
   # TODO(b/289098047): consider making this an API and changing the callers of
   # get_executable_and_time() and put_executable_and_time() to call get_cache()
   # and passing the result to them.
@@ -113,7 +125,7 @@ def _get_cache() -> Optional[CacheInterface]:
 
 def get_executable_and_time(
     cache_key: str, compile_options, backend
-) -> tuple[Optional[xla_client.LoadedExecutable], Optional[int]]:
+) -> tuple[xla_client.LoadedExecutable | None, int | None]:
   """Returns the cached executable and its compilation time if present, or None
   otherwise.
   """
@@ -150,11 +162,7 @@ def put_executable_and_time(
   if cache is None:
     logger.debug("put_executable_and_time: cache is disabled/not initialized")
     return
-  logger.debug(
-      "Writing %s to persistent compilation cache with key %s.",
-      module_name,
-      cache_key,
-  )
+
   serialized_executable = backend.serialize_executable(executable)
   executable_and_time = combine_executable_and_time(
       serialized_executable, compile_time)
@@ -163,14 +171,31 @@ def put_executable_and_time(
     executable_and_time = compressor.compress(executable_and_time)
   else:
     executable_and_time = zlib.compress(executable_and_time)
-  cache.put(cache_key, executable_and_time)
+
+  min_entry_size = config.persistent_cache_min_entry_size_bytes.value
+  entry_size = len(executable_and_time)
+  if entry_size < min_entry_size:
+    logger.info(
+        "Not writing cache entry with key %s since its size (%d bytes) "
+        "is less than threshold (%d bytes)",
+        cache_key,
+        entry_size,
+        min_entry_size,
+    )
+  else:
+    logger.debug(
+        "Writing %s to persistent compilation cache with key %s.",
+        module_name,
+        cache_key
+    )
+    monitoring.record_event('/jax/compilation_cache/cache_misses')
+    cache.put(cache_key, executable_and_time)
 
 
 def get_cache_key(module: ir.Module, devices: np.ndarray, compile_options,
-                  backend, produce_original_cache_key: bool = True) -> str:
+                  backend) -> str:
   return cache_key.get(module, devices, compile_options, backend,
-                       "zstandard" if zstandard is not None else "zlib",
-                       produce_original_cache_key)
+                       "zstandard" if zstandard is not None else "zlib")
 
 
 def is_initialized() -> bool:

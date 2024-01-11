@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import copy
 import enum
 from functools import partial
 import math
 from unittest import skipIf
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 import zlib
 
 from absl.testing import absltest
@@ -59,8 +61,8 @@ class RandomValuesCase(NamedTuple):
   params: dict
   expected: np.ndarray
   on_x64: OnX64 = OnX64.ALSO
-  atol: Optional[float] = None
-  rtol: Optional[float] = None
+  atol: float | None = None
+  rtol: float | None = None
 
   def _testname(self):
     if self.dtype is None:
@@ -400,6 +402,14 @@ class PrngTest(jtu.JaxTestCase):
         np.array([2285895361,  433833334], dtype='uint32'))
 
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
+  def test_random_seed_offset(self, make_key):
+    k1 = make_key(17)
+    with config.random_seed_offset(3):
+      k2 = make_key(17)
+    eq = k1 == k2 if k2.ndim == 0 else all(k1 == k2)
+    self.assertFalse(eq)
+
+  @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
   def test_random_bits_error(self, make_key):
     msg = 'dtype argument .* must be an unsigned int dtype'
     with self.assertRaisesRegex(ValueError, msg):
@@ -562,7 +572,6 @@ class PrngTest(jtu.JaxTestCase):
 
 class ThreefryPrngTest(jtu.JaxTestCase):
   @parameterized.parameters([{'make_key': ctor} for ctor in [
-      jax_random.threefry2x32_key,
       partial(random.PRNGKey, impl='threefry2x32'),
       partial(random.key, impl='threefry2x32')]])
   def test_seed_no_implicit_transfers(self, make_key):
@@ -582,9 +591,9 @@ class KeyArrayTest(jtu.JaxTestCase):
   #
   # A handful of these tests follow CustomElementTypesTest in
   # lax_tests.py as an example. If you add a test here (e.g. testing
-  # lowering of an key-dtyped shaped array), consider whether it
+  # lowering of a key-dtyped shaped array), consider whether it
   # might also be a more general test of opaque element types. If
-  # so, add a corresponding test to to CustomElementTypesTest as well.
+  # so, add a corresponding test to CustomElementTypesTest as well.
 
   def assertKeysEqual(self, key1, key2):
     self.assertEqual(key1.dtype, key2.dtype)
@@ -986,8 +995,7 @@ class KeyArrayTest(jtu.JaxTestCase):
     custom_result = jax.grad(f)(0.0, key)
 
     self.assertAllClose(default_result, custom_result)
-    self.assertIsInstance(key_dot, prng_internal.PRNGKeyArray)
-    self.assertArraysEqual(random.key_data(key_dot), np.uint32(0))
+    self.assertEqual(key_dot.dtype, dtypes.float0)
 
   def test_key_array_indexing_0d(self):
     key = self.make_keys()
@@ -1116,8 +1124,8 @@ class KeyArrayTest(jtu.JaxTestCase):
     def _f_fwd(_, state):
       return state, None
     def _f_bwd(_, state_bar):
-      assert state_bar[1].dtype.name == "key<fry_t>"  # key tangent type
-      return state_bar
+      assert state_bar[1].dtype == dtypes.float0  # key tangent type
+      return state_bar[0], state_bar
     f.defvjp(_f_fwd, _f_bwd)
     state = (8.0, jax.random.key(123))
     result = jax.grad(lambda theta: f(theta, state)[0])(3.0)
@@ -1130,9 +1138,9 @@ class KeyArrayTest(jtu.JaxTestCase):
     def _f_fwd(_, state):
       return tree_util.tree_map(lambda x: x.value, state), None
     def _f_bwd(_, state_bar):
-      self.assertTrue(dtypes.issubdtype(state_bar[1].dtype, dtypes.prng_key))
+      self.assertTrue(state_bar[1].dtype == dtypes.float0)
       self.assertIsInstance(state_bar[1], jax.custom_derivatives.SymbolicZero)
-      return state_bar
+      return state_bar[0], state_bar
     f.defvjp(_f_fwd, _f_bwd, symbolic_zeros=True)
     state = (8.0, jax.random.key(123))
     result = jax.grad(lambda theta: f(theta, state)[0])(3.0)
@@ -1391,8 +1399,10 @@ class JnpWithKeyArrayTest(jtu.JaxTestCase):
       jnp.negative(key)
     with self.assertRaisesRegex(TypeError, "neg does not accept dtype key<fry>"):
       -key
-    with self.assertRaisesRegex(ValueError, "Cannot call convert_element_type on dtype key<fry>"):
+    with self.assertRaisesRegex(ValueError, "Cannot convert_element_type from key<fry> to int(32|64)"):
       lax.convert_element_type(key, int)
+    with self.assertRaisesRegex(ValueError, "Cannot convert_element_type from int32 to key<fry>"):
+      lax.convert_element_type(np.int32(0), key.dtype)
 
   def test_eval_shape(self):
     key = random.key(1701)

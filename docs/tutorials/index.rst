@@ -20,9 +20,11 @@ JAX 101
    installation
    quickstart
    jax-as-accelerated-numpy
+   thinking-in-jax
    jit-compilation
    automatic-vectorization
    automatic-differentiation
+   debugging
    random-numbers
    working-with-pytrees
    single-host-sharding
@@ -38,8 +40,9 @@ JAX 201
 
    parallelism
    advanced-autodiff
+   gradient-checkpointing
+   advanced-debugging
    external-callbacks
-   debugging
    profiling-and-performance
 
 
@@ -49,5 +52,6 @@ JAX 301
 .. toctree::
    :maxdepth: 1
 
+   jaxpr
    jax-internals
    advanced-compilation

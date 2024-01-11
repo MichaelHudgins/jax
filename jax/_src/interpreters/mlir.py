@@ -23,6 +23,7 @@ from functools import partial
 import io
 import itertools
 import operator
+import os
 import re
 import typing
 from typing import Any, Callable, NamedTuple, Protocol, Union
@@ -36,6 +37,7 @@ from jax._src import core
 from jax._src import dtypes
 from jax._src import effects as effects_lib
 from jax._src import linear_util as lu
+from jax._src import path
 from jax._src import pickle_util
 from jax._src import sharding_impls
 from jax._src import source_info_util
@@ -64,6 +66,13 @@ Value = Any  # = ir.Value
 # mypy implicitly sets this variable to true when type checking.
 MYPY = False
 
+_JAX_DUMP_IR_TO = config.DEFINE_string(
+    'jax_dump_ir_to', os.getenv('JAX_DUMP_IR_TO', ''),
+    help="Path to which the IR that is emitted by JAX should be dumped as "
+         "text files. If omitted, JAX will not dump IR. "
+         "Supports the special value 'sponge' to pick the path from the "
+         "environment variable TEST_UNDECLARED_OUTPUTS_DIR.")
+
 lowerable_effects: effects_lib.EffectTypeSet = effects_lib.lowerable_effects
 
 
@@ -71,6 +80,11 @@ lowerable_effects: effects_lib.EffectTypeSet = effects_lib.lowerable_effects
 
 def dense_int_elements(xs) -> ir.DenseIntElementsAttr:
   return ir.DenseIntElementsAttr.get(np.asarray(xs, np.int64))
+
+def dense_int_array(xs) -> ir.DenseIntElementsAttr | ir.DenseI64ArrayAttr:
+  if hlo.get_api_version() < 5:
+    return dense_int_elements(xs)
+  return ir.DenseI64ArrayAttr.get(np.asarray(xs, np.int64))
 
 def dense_bool_elements(xs: Sequence[bool]) -> ir.DenseElementsAttr:
   a = np.packbits(np.array(xs, np.bool_), bitorder='little')
@@ -316,25 +330,56 @@ register_constant_handler(core.Token, _token_constant_handler)
 
 # Source locations
 
-def get_canonical_source_file(frame: source_info_util.Frame) -> str:
-  source_file = frame.file_name
-  if pattern := config.hlo_source_file_canonicalization_regex.value:
+def get_canonical_source_file(file_name: str, caches: TracebackCaches) -> str:
+  if file_name in caches.canonical_name_cache:
+    return caches.canonical_name_cache[file_name]
+
+  source_file = file_name
+  pattern = config.hlo_source_file_canonicalization_regex.value
+  if pattern:
     source_file = re.sub(pattern, '', source_file)
+
+  caches.canonical_name_cache[file_name] = source_file
   return source_file
 
-def _traceback_to_location(tb: xc.Traceback) -> ir.Location:
+def _is_user_file(ctx: ModuleContext, file_name: str) -> bool:
+  if file_name in ctx.traceback_caches.is_user_file_cache:
+    return ctx.traceback_caches.is_user_file_cache[file_name]
+
+  result = source_info_util.is_user_filename(file_name)
+  ctx.traceback_caches.is_user_file_cache[file_name] = result
+  return result
+
+def _raw_frame_to_frame(ctx: ModuleContext,
+                        code: source_info_util.types.CodeType, lasti: int):
+  key = (code.co_filename, lasti)
+  if key in ctx.traceback_caches.raw_frame_to_frame_cache:
+    return ctx.traceback_caches.raw_frame_to_frame_cache[key]
+  frame = source_info_util.raw_frame_to_frame(code, lasti)
+  ctx.traceback_caches.raw_frame_to_frame_cache[key] = frame
+  return frame
+
+def _traceback_to_location(ctx: ModuleContext, tb: xc.Traceback) -> ir.Location:
   """Converts a full traceback to a callsite() MLIR location."""
   frame_locs = []
+  frames_limit = config.traceback_in_locations_limit.value
+  if frames_limit == 0:
+    return ir.Location.unknown()
+
   for code, lasti in zip(*tb.raw_frames()):
-    frame = source_info_util.raw_frame_to_frame(code, lasti)
-    if source_info_util.is_user_filename(frame.file_name):
-      file_loc = ir.Location.file(
-          get_canonical_source_file(frame),
-          frame.start_line,
-          frame.start_column,
-      )
-      name_loc = ir.Location.name(frame.function_name, childLoc=file_loc)
-      frame_locs.append(name_loc)
+    if not _is_user_file(ctx, code.co_filename):
+      continue
+
+    frame = _raw_frame_to_frame(ctx, code, lasti)
+    file_loc = ir.Location.file(
+        get_canonical_source_file(frame.file_name, ctx.traceback_caches),
+        frame.start_line,
+        frame.start_column,
+    )
+    name_loc = ir.Location.name(frame.function_name, childLoc=file_loc)
+    frame_locs.append(name_loc)
+    if frames_limit > 0 and len(frame_locs) >= frames_limit:
+      break
 
   if len(frame_locs) == 0:
     return ir.Location.unknown()
@@ -345,22 +390,22 @@ def _traceback_to_location(tb: xc.Traceback) -> ir.Location:
     return ir.Location.callsite(frame_locs[0], frame_locs[1:])
 
 def _source_info_to_location(
-    primitive: core.Primitive, params: dict,
-    source_info: source_info_util.SourceInfo,
-    name_stack: source_info_util.NameStack) -> ir.Location:
+    ctx: ModuleContext, primitive: core.Primitive, params: dict[str, Any],
+    source_info: source_info_util.SourceInfo) -> ir.Location:
   eqn_str = (f'{source_info.name_stack}/'
              f'{core.str_eqn_compact(primitive.name, params)}')
   if config.include_full_tracebacks_in_locations.value:
     if source_info.traceback is None:
       loc = ir.Location.unknown()
     else:
-      loc = _traceback_to_location(source_info.traceback)
+      loc = _traceback_to_location(ctx, source_info.traceback)
   else:
     frame = source_info_util.user_frame(source_info)
     if frame is None:
       loc = ir.Location.unknown()
     else:
-      loc = ir.Location.file(get_canonical_source_file(frame),
+      loc = ir.Location.file(get_canonical_source_file(frame.file_name,
+                                                       ctx.traceback_caches),
                              frame.start_line, frame.start_column)
   loc = ir.Location.name(eqn_str, childLoc=loc)
   # TODO(phawkins): also include primitive.name as the operator type.
@@ -369,6 +414,64 @@ def _source_info_to_location(
 upstream_dialects = ir.DialectRegistry()
 if register_jax_dialects:
   register_jax_dialects.register_dialects(upstream_dialects)
+
+# Dumping MLIR modules
+_ir_dump_counter = itertools.count()
+
+def dump_module_to_file(module: ir.Module, stage_name: str) -> str | None:
+  """Dumps the `module` IR to a file.
+
+  Dumps the module if JAX_DUMP_IR_TO is defined.
+
+  Args:
+    module: The module to dump
+    stage_name: A name to distinguish different stages of a module, will be
+      appended to the `module.name`.
+
+  Returns:
+    The name of the file containing the dump if JAX_DUMP_IR_TO is defined and
+    the module was dumped, `None` otherwise.
+  """
+  out_dir_name = _JAX_DUMP_IR_TO.value
+  if not out_dir_name:
+    return None
+  if out_dir_name == "sponge":
+    out_dir_name = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", "")
+    if not out_dir_name:
+      raise ValueError("JAX_DUMP_IR_TO='sponge' but "
+                       "TEST_UNDECLARED_OUTPUTS_DIR is not defined")
+
+  id = next(_ir_dump_counter)
+  sym_name = module.operation.attributes['sym_name']
+  module_name = ir.StringAttr(sym_name).value
+
+  name = f"jax_ir{id}_{_make_string_safe_for_filename(module_name)}_{stage_name}.mlir"
+
+  out_dir = path.Path(out_dir_name)
+  out_dir.mkdir(parents=True, exist_ok=True)
+  full_path = out_dir / name
+  full_path.write_text(module_to_string(module))
+  return name
+
+def dump_module_message(module: ir.Module, stage_name: str) -> str:
+  dumped_to = dump_module_to_file(module, stage_name)
+  if dumped_to:
+    return f"The module was dumped to {dumped_to}."
+  else:
+    return "Define JAX_DUMP_IR_TO to dump the module."
+
+def _make_string_safe_for_filename(s: str) -> str:
+  return re.sub(r'[^\w.)( -]', '', s)
+
+def module_to_string(module: ir.Module) -> str:
+  output = io.StringIO()
+  module.operation.print(file=output, enable_debug_info=True)
+  return output.getvalue()
+
+def module_to_bytecode(module: ir.Module) -> bytes:
+  output = io.BytesIO()
+  module.operation.write_bytecode(file=output)
+  return output.getvalue()
 
 # Translation rules
 def make_ir_context() -> ir.Context:
@@ -460,6 +563,16 @@ class LoweringParameters:
   # native execution (and we can remove this parameter).
   replace_tokens_with_dummy: bool = True
 
+@dataclasses.dataclass
+class TracebackCaches:
+  canonical_name_cache: dict[str, str]
+  is_user_file_cache: dict[str, bool]
+  raw_frame_to_frame_cache: dict[tuple[str, int], source_info_util.Frame]
+
+  def __init__(self):
+    self.canonical_name_cache = {}
+    self.is_user_file_cache = {}
+    self.raw_frame_to_frame_cache = {}
 
 @dataclasses.dataclass
 class ModuleContext:
@@ -480,6 +593,9 @@ class ModuleContext:
 
   # Cached primitive lowerings.
   cached_primitive_lowerings: dict[Any, func_dialect.FuncOp]
+
+  # Cached traceback infromation.
+  traceback_caches: TracebackCaches
 
   lowering_parameters: LoweringParameters
 
@@ -504,6 +620,7 @@ class ModuleContext:
       symbol_table: ir.SymbolTable | None = None,
       cached_primitive_lowerings: None | (dict[Any,
                                                 func_dialect.FuncOp]) = None,
+      traceback_caches: None | TracebackCaches = None,
       shape_poly_state = None):
 
     self.context = context or make_ir_context()
@@ -516,6 +633,8 @@ class ModuleContext:
     self.name_stack = name_stack
     self.cached_primitive_lowerings = ({} if cached_primitive_lowerings is None
                                        else cached_primitive_lowerings)
+    self.traceback_caches = (TracebackCaches() if traceback_caches is None
+                             else traceback_caches)
     self.channel_iterator = channel_iterator
     self.keepalives = keepalives
     self.host_callbacks = host_callbacks
@@ -858,9 +977,9 @@ def lower_jaxpr_to_module(
 
   try:
     if not ctx.module.operation.verify():
-      module_string = module_to_string(ctx.module)
       raise ValueError(
-          f"Cannot lower jaxpr with verifier errors: {module_string}")
+          "Cannot lower jaxpr with verifier errors." +
+          dump_module_message(ctx.module, "verification"))
   except ir.MLIRError as e:
     msg_lines = ["Cannot lower jaxpr with verifier errors:"]
     def emit_diagnostic_info(d):
@@ -870,23 +989,11 @@ def lower_jaxpr_to_module(
         emit_diagnostic_info(n)
     for d in e.error_diagnostics:
       emit_diagnostic_info(d)
-    msg_lines.append("Module string:")
-    msg_lines.append(module_to_string(ctx.module))
-    raise ValueError("\n".join(msg_lines)) from e
+    raise ValueError("\n".join(msg_lines) +
+                     dump_module_message(ctx.module, "verification")) from e
 
   return LoweringResult(ctx.module, ctx.keepalives, ctx.host_callbacks,
                         ctx.shape_poly_state)
-
-def module_to_string(module: ir.Module) -> str:
-  output = io.StringIO()
-  module.operation.print(file=output, enable_debug_info=True)
-  return output.getvalue()
-
-def module_to_bytecode(module: ir.Module) -> bytes:
-  output = io.BytesIO()
-  module.operation.write_bytecode(file=output)
-  return output.getvalue()
-
 
 def _set_up_aliases(avals_in, avals_out, donated_args, arg_memory_kinds,
                     result_memory_kinds):
@@ -942,7 +1049,7 @@ class TokenSet:
   primitives. A `TokenSet` encapsulates a set of HLO tokens that will be
   used by the lowering rules.
   """
-  _tokens: typing.OrderedDict[core.Effect, Token]
+  _tokens: collections.OrderedDict[core.Effect, Token]
 
   def __init__(self, *args, **kwargs):
     self._tokens = collections.OrderedDict(*args, **kwargs)
@@ -1448,8 +1555,7 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
     assert isinstance(ctx.name_stack, source_info_util.NameStack), type(ctx.name_stack)
     source_info = eqn.source_info.replace(
         name_stack=ctx.name_stack + eqn.source_info.name_stack)
-    loc = _source_info_to_location(eqn.primitive, eqn.params, source_info,
-                                   ctx.name_stack)
+    loc = _source_info_to_location(ctx, eqn.primitive, eqn.params, source_info)
     with source_info_util.user_context(eqn.source_info.traceback), loc:
       override_rule = get_override_lowering_rule(eqn.primitive)
       platform_rules: dict[str, LoweringRule] = {}
@@ -1733,7 +1839,7 @@ def _call_lowering(fn_name, stack_name, call_jaxpr, backend,
                    arg_names=None, result_names=None):
   del stack_name, avals_in
   if isinstance(call_jaxpr, core.Jaxpr):
-    call_jaxpr = core.ClosedJaxpr(call_jaxpr, ())
+    call_jaxpr = pe.close_jaxpr(call_jaxpr)
   check_backend_matches(backend, ctx.platforms)
   effects = list(tokens_in.effects())
   output_types = map(aval_to_ir_types, avals_out)
@@ -1844,9 +1950,9 @@ def slice_op(ctx: LoweringRuleContext, x, aval_out, *,
         x, start_indices, limit_indices, strides)
     else:
       return hlo.slice(x,
-                       dense_int_elements(start_indices),
-                       dense_int_elements(limit_indices),
-                       dense_int_elements(strides))
+                       dense_int_array(start_indices),
+                       dense_int_array(limit_indices),
+                       dense_int_array(strides))
 
 def dynamic_slice(ctx: LoweringRuleContext, aval_out, x, *,
                   start_indices) -> ir.Value:
@@ -1881,7 +1987,7 @@ def dynamic_slice(ctx: LoweringRuleContext, aval_out, x, *,
         shape_tensor([1] * len(start_indices))
     )
   else:
-    return hlo.dynamic_slice(x, start_indices, dense_int_elements(slice_sizes))
+    return hlo.dynamic_slice(x, start_indices, dense_int_array(slice_sizes))
 
 def dynamic_update_slice(ctx: LoweringRuleContext, aval_out, x, update, *,
                          start_indices) -> ir.Value:
@@ -1906,9 +2012,9 @@ def pad(ctx: LoweringRuleContext, aval_out,
   if all(core.is_constant_shape(s) for s in (padding_low,
                                              padding_high, padding_interior)):
     return hlo.pad(x, padding_value,
-                   dense_int_elements(padding_low),
-                   dense_int_elements(padding_high),
-                   dense_int_elements(padding_interior))
+                   dense_int_array(padding_low),
+                   dense_int_array(padding_high),
+                   dense_int_array(padding_interior))
   else:
     padding_low = eval_dynamic_shape_as_tensor(ctx, padding_low)
     padding_high = eval_dynamic_shape_as_tensor(ctx, padding_high)
@@ -1933,13 +2039,10 @@ def full_like_aval(ctx: LoweringRuleContext, value, aval: core.ShapedArray) -> i
   zero = ir_constant(np.array(value, dtypes.canonicalize_dtype(aval.dtype)))
   return broadcast_in_dim(ctx, zero, aval, broadcast_dimensions=())
 
-def zeros_like_lowering(ctx, x):
-  aval, = ctx.avals_in
-  assert isinstance(aval, core.ShapedArray), aval
-  return [full_like_aval(ctx, 0, aval)]
-register_lowering(ad_util.zeros_like_p, zeros_like_lowering)
-
 def add_jaxvals_lowering(ctx, x, y):
+  if (isinstance(a := ctx.avals_in[0], core.ShapedArray) and
+      dtypes.issubdtype(a.dtype, dtypes.extended)):
+    return lower_fun(lambda x, y: [a.dtype._rules.add(a.dtype, x, y)])(ctx, x, y)  # type: ignore
   return [hlo.add(x, y)]
 register_lowering(ad_util.add_jaxvals_p, add_jaxvals_lowering)
 
@@ -2002,7 +2105,8 @@ def _wrap_with_spmd_op(name: str,
                        x: ir.Value,
                        aval_out: core.AbstractValue,
                        sharding_proto: xc.OpSharding,
-                       unspecified_dims: set[int] | None = None):
+                       unspecified_dims: set[int] | None = None,
+                       has_side_effect: bool = False):
   # unspecified_dims indicate dimensions whose shardings are not specified and
   # XLA sharding propagation can change them.
   if unspecified_dims:
@@ -2020,7 +2124,8 @@ def _wrap_with_spmd_op(name: str,
   op = custom_call(name, result_types=[result_type], operands=[x],
                    backend_config=backend_config,
                    api_version=1,
-                   result_shapes=result_shapes)
+                   result_shapes=result_shapes,
+                   has_side_effect=has_side_effect)
   set_sharding(op, sharding_proto)
   return op.result
 
@@ -2199,28 +2304,6 @@ DEVICE_TO_DEVICE_TYPE = 1
 SEND_TO_HOST_TYPE = 2
 RECV_FROM_HOST_TYPE = 3
 
-_dtype_to_xla_type_string_map = {
-    np.dtype("bool"): "pred",
-    np.dtype("float16"): "f16",
-    np.dtype("float32"): "f32",
-    np.dtype("float64"): "f64",
-    np.dtype("int8"): "s8",
-    np.dtype("uint8"): "u8",
-    np.dtype("int16"): "s16",
-    np.dtype("uint16"): "u16",
-    np.dtype("int32"): "s32",
-    np.dtype("uint32"): "u32",
-    np.dtype("int64"): "s64",
-    np.dtype("uint64"): "u64",
-    dtypes._bfloat16_dtype: "bf16",
-    np.dtype("complex64"): "c64",
-    np.dtype("complex128"): "c128",
-}
-
-def _dtype_to_xla_type_string(dtype: np.dtype) -> str:
-  if dtype not in _dtype_to_xla_type_string_map:
-    raise NotImplementedError(dtype)
-  return _dtype_to_xla_type_string_map[dtype]
 
 def is_empty_shape(s: core.Shape) -> bool:
   return any(d == 0 for d in s)
@@ -2654,9 +2737,14 @@ def refine_polymorphic_shapes(module: ir.Module) -> ir.Module:
   shape polymorphism, runs shape refinement to resolve all the dynamic shapes.
   Then verifies that there are no more dynamic shapes in the module.
   """
-  refined_module_str = xla_extension.mlir.refine_polymorphic_shapes(
-    module_to_bytecode(module), enable_shape_assertions=True,
-    validate_static_shapes=True)
+  try:
+    refined_module_str = xla_extension.mlir.refine_polymorphic_shapes(
+      module_to_bytecode(module), enable_shape_assertions=True,
+      validate_static_shapes=True)
+  except Exception as e:
+    raise ValueError(
+        "Error refining shapes. " +
+        dump_module_message(module, "before_refine_polymorphic_shapes")) from e
 
   context = make_ir_context()
   with context:

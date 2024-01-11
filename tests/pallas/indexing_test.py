@@ -13,14 +13,16 @@
 # limitations under the License.
 
 """Tests for Pallas indexing logic and abstractions."""
-from typing import Union
+
+from __future__ import annotations
+
 import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax._src import util
-from jax._src.pallas import indexing
+from jax._src.state import indexing
 import numpy as np
 
 try:
@@ -45,9 +47,10 @@ def int_indexer_strategy(dim) -> hps.SearchStrategy[int]:
 
 
 @hps.composite
-def slice_indexer_strategy(draw, dim) -> Union[Slice, slice]:
+def slice_indexer_strategy(draw, dim) -> Slice | slice:
   start = draw(int_indexer_strategy(dim))
-  size = draw(hps.integers(min_value=0, max_value=np.iinfo(np.int32).max))
+  max_size = dim - start
+  size = draw(hps.integers(min_value=0, max_value=max_size))
   return draw(
       hps.one_of(
           hps.just(Slice(start, size)), hps.just(slice(start, start + size))
@@ -64,7 +67,7 @@ def array_indexer_strategy(draw, shape) -> jax.Array:
 
 @hps.composite
 def indexer_strategy(draw, dim, int_indexer_shape
-                     ) -> Union[int, Slice, jax.Array]:
+                     ) -> int | Slice | jax.Array:
   return draw(hps.one_of(
       int_indexer_strategy(dim),
       slice_indexer_strategy(dim),
@@ -76,8 +79,8 @@ def indexer_strategy(draw, dim, int_indexer_shape
 def nd_indexer_strategy(draw, shape) -> NDIndexer:
   num_indices = draw(hps.integers(min_value=0, max_value=len(shape)))
   int_indexer_shape = draw(hnp.array_shapes())
-  indices = [draw(indexer_strategy(dim, int_indexer_shape)) for dim
-             in shape[:num_indices]]
+  indices = tuple(draw(indexer_strategy(dim, int_indexer_shape))
+                  for dim in shape[:num_indices])
   return NDIndexer.from_indices_shape(indices, shape)
 
 
@@ -92,6 +95,24 @@ class IndexerTest(parameterized.TestCase):
   def test_invalid_ndindexer(self):
     indices = (0, 0, 0)
     shape = (5, 5)
+    with self.assertRaises(ValueError):
+      _ = NDIndexer.from_indices_shape(indices, shape)
+
+  def test_invalid_ndindexer_oob_int(self):
+    indices = (4, 0)
+    shape = (3, 5)
+    with self.assertRaises(ValueError):
+      _ = NDIndexer.from_indices_shape(indices, shape)
+
+  def test_invalid_ndindexer_oob_slice_start(self):
+    indices = (slice(3, 2), 0)
+    shape = (3, 5)
+    with self.assertRaises(ValueError):
+      _ = NDIndexer.from_indices_shape(indices, shape)
+
+  def test_invalid_ndindexer_oob_slice_end(self):
+    indices = (Slice(2, 2), 0)
+    shape = (3, 5)
     with self.assertRaises(ValueError):
       _ = NDIndexer.from_indices_shape(indices, shape)
 
@@ -135,17 +156,17 @@ class IndexerTest(parameterized.TestCase):
     indexer = NDIndexer.from_indices_shape(indices, shape)
     self.assertTupleEqual(indexer.get_indexer_shape(), (5, 3))
 
-    indices = (0, slice(4, 10), np.arange(5))
+    indices = (0, slice(2, 10), np.arange(5))
     indexer = NDIndexer.from_indices_shape(indices, shape)
-    self.assertTupleEqual(indexer.get_indexer_shape(), (5, 0))
+    self.assertTupleEqual(indexer.get_indexer_shape(), (5, 1))
 
-    indices = (0, 5, np.arange(5))
+    indices = (0, 1, np.arange(5))
     indexer = NDIndexer.from_indices_shape(indices, shape)
     self.assertTupleEqual(indexer.get_indexer_shape(), (5,))
 
-    indices = (ds(2, 3), np.arange(5)[:, None], np.arange(4)[None])
+    indices = (ds(0, 2), np.arange(5)[:, None], np.arange(4)[None])
     indexer = NDIndexer.from_indices_shape(indices, shape)
-    self.assertTupleEqual(indexer.get_indexer_shape(), (5, 4, 3))
+    self.assertTupleEqual(indexer.get_indexer_shape(), (5, 4, 2))
 
   @hp.given(hps.data())
   def test_ndindexer(self, data):

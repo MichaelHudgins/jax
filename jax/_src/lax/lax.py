@@ -22,8 +22,7 @@ from functools import partial
 import itertools
 import math
 import operator
-from typing import (Any, Callable, TypeVar, Union,
-                    cast as type_cast, overload)
+from typing import Any, Callable, TypeVar, Union, cast as type_cast, overload
 import warnings
 
 import numpy as np
@@ -41,6 +40,7 @@ from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import effects
+from jax._src import shard_alike
 from jax._src import linear_util as lu
 from jax._src import pretty_printer as pp
 from jax._src import source_info_util
@@ -673,8 +673,13 @@ class Precision(xla_client.PrecisionConfig.Precision):  # type: ignore
 
 
 PrecisionType = Precision
-PrecisionLike = Union[None, str, PrecisionType, tuple[str, str],
-                      tuple[PrecisionType, PrecisionType]]
+PrecisionLike = Union[
+    str,
+    PrecisionType,
+    tuple[str, str],
+    tuple[PrecisionType, PrecisionType],
+    None,
+]
 
 def dot(lhs: Array, rhs: Array, precision: PrecisionLike = None,
         preferred_element_type: DTypeLike | None = None) -> Array:
@@ -1004,10 +1009,10 @@ def reduce(operands: Any,
                                  weak_type=weak_type)
   else:
     flat_init_avals = safe_map(_abstractify, flat_init_values)
-    jaxpr, consts, out_tree = _variadic_reduction_jaxpr(
+    closed_jaxpr, out_tree = _variadic_reduction_jaxpr(
         computation, tuple(flat_init_avals), init_value_tree)
     out = reduce_p.bind(*flat_operands, *flat_init_values, computation=computation,
-                        jaxpr=jaxpr, consts=consts, dimensions=tuple(dimensions))
+                        jaxpr=closed_jaxpr, dimensions=tuple(dimensions))
     return tree_util.tree_unflatten(out_tree, out)
 
 @cache()
@@ -1039,7 +1044,7 @@ def _variadic_reduction_jaxpr(computation, flat_avals, aval_tree):
     raise NotImplementedError(
         "Reduction computations can't close over Tracers. Please open an issue "
         "at https://github.com/google/jax.")
-  return jaxpr, tuple(consts), out_tree()
+  return core.ClosedJaxpr(jaxpr, consts), out_tree()
 
 def _get_monoid_reducer(monoid_op: Callable,
                         xs: Sequence[Array]) -> Callable | None:
@@ -1081,7 +1086,8 @@ def _get_prod_identity(dtype: DTypeLike) -> np.ndarray:
 
 def _get_max_identity(dtype: DTypeLike) -> np.ndarray:
   if dtypes.issubdtype(dtype, np.inexact):
-    return np.array(-np.inf, dtype)
+    return np.array(-np.inf if dtypes.supports_inf(dtype) else dtypes.finfo(dtype).min,
+                    dtype=dtype)
   elif dtypes.issubdtype(dtype, np.integer):
     return np.array(dtypes.iinfo(dtype).min, dtype)
   elif dtypes.issubdtype(dtype, np.bool_):
@@ -1091,7 +1097,8 @@ def _get_max_identity(dtype: DTypeLike) -> np.ndarray:
 
 def _get_min_identity(dtype: DTypeLike) -> np.ndarray:
   if dtypes.issubdtype(dtype, np.inexact):
-    return np.array(np.inf, dtype)
+    return np.array(np.inf if dtypes.supports_inf(dtype) else dtypes.finfo(dtype).max,
+                    dtype=dtype)
   elif dtypes.issubdtype(dtype, np.integer):
     return np.array(dtypes.iinfo(dtype).max, dtype)
   elif dtypes.issubdtype(dtype, np.bool_):
@@ -1218,7 +1225,9 @@ def full(shape: Shape, fill_value: ArrayLike, dtype: DTypeLike | None = None) ->
 
 def zeros_like_shaped_array(aval: ShapedArray) -> Array:
   assert isinstance(aval, ShapedArray)
-  if aval.dtype == dtypes.float0:
+  if dtypes.issubdtype(aval.dtype, dtypes.extended):
+    scalar_zero = aval.dtype._rules.zero(aval.dtype)
+  elif aval.dtype == dtypes.float0:
     scalar_zero = np.zeros((), dtype=aval.dtype)
   else:
     scalar_zero = _convert_element_type(0, aval.dtype, aval.weak_type)
@@ -1363,19 +1372,10 @@ def full_like(x: ArrayLike | DuckTypedArray,
   if dtypes.issubdtype(dtype, dtypes.extended):
     return dtype._rules.full(fill_shape, fill_value, dtype)  # type: ignore[union-attr]
   val = full(fill_shape, _convert_element_type(fill_value, dtype, weak_type))
-  # If the sharding is SingleDeviceSharding then don't take the `if` branch
-  # because `val` is already an array with SingleDeviceSharding making this an
-  # optimization.
-  # TODO(yashkatariya,mattjj): `x` and `val` should have the same sharding,
-  # probably in the form of a primitive like `val = match_sharding_p.bind(x, val)`
-  # (so it works in staged-out code as well as 'eager' code). Related to
-  # equi-sharding.
+  # TODO(yashkatariya): Use shard_like in tracing mode too i.e. remove the
+  # ArrayImpl check.
   if shape is None and isinstance(x, array.ArrayImpl):
-    sharding = x.sharding  # type: ignore[union-attr]
-    if (not dispatch.is_single_device_sharding(sharding) and
-        not isinstance(sharding, PmapSharding)):
-      return array.make_array_from_callback(
-          type_cast(array.Shape, fill_shape), sharding, lambda idx: val[idx])
+    return shard_alike.shard_alike(x, val)[1]
   return val
 
 
@@ -1501,15 +1501,19 @@ def _iter(tracer):
 ShapedArray._iter = staticmethod(_iter)
 core.DShapedArray._iter = staticmethod(_iter)
 
-# Add some ad handlers that use (or could use) lax primitives
-
 def zeros_like_array(x: ArrayLike) -> Array:
   return full_like(x, 0)
 
+
+def _add_arrays(x, y):
+  if (isinstance(a := core.get_aval(x), ShapedArray) and
+      dtypes.issubdtype(a.dtype, dtypes.extended)):
+    return dtype._rules.add(dtype, x, y)  # type: ignore
+  return add(x, y)
+
 for t in itertools.chain(
     dtypes.python_scalar_dtypes.keys(), array_types, [array.ArrayImpl]):
-  ad_util.jaxval_adders[t] = add
-ad_util.jaxval_zeros_likers[array.ArrayImpl] = zeros_like_array
+  ad_util.raw_jaxval_adders[t] = _add_arrays
 
 
 ### primitives
@@ -2331,15 +2335,14 @@ def _convert_element_type_shape_rule(operand, *, new_dtype, weak_type):
   return operand.shape
 
 def _convert_element_type_dtype_rule(operand, *, new_dtype, weak_type):
-  if operand.dtype != new_dtype:
-    if (dtypes.issubdtype(operand.dtype, dtypes.extended) and
-        not isinstance(operand.dtype, core.bint)):
-      raise ValueError(
-          f"Cannot call convert_element_type on dtype {dtype_to_string(operand.dtype)}")
-    if (dtypes.issubdtype(new_dtype, dtypes.extended) and
-        not isinstance(new_dtype, core.bint)):
-      raise ValueError(
-          f"Cannot convert_element_type to dtype={dtype_to_string(new_dtype)}")
+  if (operand.dtype != new_dtype and
+      ((dtypes.issubdtype(operand.dtype, dtypes.extended) and
+        not operand.dtype._rules.convert_from(operand.dtype, new_dtype)) or  # type: ignore
+       (dtypes.issubdtype(new_dtype, dtypes.extended) and
+        not new_dtype._rules.convert_to(operand.dtype, new_dtype)))):  # type: ignore
+    raise ValueError(
+        f"Cannot convert_element_type from {dtype_to_string(operand.dtype)} "
+        f"to {dtype_to_string(new_dtype)}")
   return new_dtype
 
 def _convert_element_type_weak_type_rule(operand, *, new_dtype, weak_type):
@@ -2378,7 +2381,9 @@ def _convert_elt_type_folding_rule(consts, eqn):
   if (type(c) in {np.ndarray, *dtypes.python_scalar_dtypes} and
       isinstance(o.aval, core.UnshapedArray) and not np.shape(c) and
       not dtypes.issubdtype(eqn.params['new_dtype'], dtypes.extended)):
-    out = np.array(c, eqn.params['new_dtype'])
+    with warnings.catch_warnings():
+      warnings.simplefilter('ignore', util.NumpyComplexWarning)
+      out = np.array(c).astype(eqn.params['new_dtype'])
     if not o.aval.weak_type:
       return [out], None
     out = out.item()
@@ -3423,7 +3428,7 @@ def _reshape_batch_rule(batched_args, batch_dims, *, new_sizes, dimensions):
 def _reshape_lower(ctx, x, *dyn_shape, new_sizes, dimensions):
   aval_out, = ctx.avals_out
   if dimensions is not None:
-    x = hlo.transpose(x, mlir.dense_int_elements(dimensions))
+    x = hlo.transpose(x, mlir.dense_int_array(dimensions))
   if dyn_shape:
     aval_out = aval_out.update(shape=_merge_dyn_shape(new_sizes, dyn_shape))
   return [mlir.reshape(ctx, x, aval_out)]
@@ -3467,7 +3472,7 @@ ad.deflinear2(rev_p, lambda t, _, dimensions: [rev(t, dimensions)])
 batching.primitive_batchers[rev_p] = _rev_batch_rule
 
 def _rev_lower(ctx, x, *, dimensions):
-  return [hlo.reverse(x, mlir.dense_int_elements(dimensions))]
+  return [hlo.reverse(x, mlir.dense_int_array(dimensions))]
 mlir.register_lowering(rev_p, _rev_lower)
 
 
@@ -3499,7 +3504,7 @@ def _transpose_lower(ctx, x, *, permutation):
         aval_out.dtype).shape
     trailing_dims = [aval_out.ndim + i for i in range(len(elt_shape))]
     permutation = [*permutation, *trailing_dims]
-  return [hlo.transpose(x, mlir.dense_int_elements(permutation))]
+  return [hlo.transpose(x, mlir.dense_int_array(permutation))]
 
 transpose_p = standard_primitive(_transpose_shape_rule, _input_dtype,
                                  'transpose')
@@ -3662,14 +3667,14 @@ mlir.register_lowering(select_n_p, _select_hlo_lowering)
 pe.def_trivial_padding(select_n_p)
 
 
-def _reduce_shape_rule(*avals, computation, jaxpr, consts, dimensions):
+def _reduce_shape_rule(*avals, computation, jaxpr, dimensions):
   operand_avals, init_val_avals = split_list(avals, [len(avals) // 2])
   if any(arg.shape != () for arg in init_val_avals):
     init_val_shapes = [a.shape for a in init_val_avals]
     raise ValueError(f'reduce found non-scalar initial value: {init_val_shapes}')
   return [tuple(np.delete(op.shape, dimensions)) for op in operand_avals]
 
-def _reduce_dtype_rule(*avals, computation, jaxpr, consts, dimensions):
+def _reduce_dtype_rule(*avals, computation, jaxpr, dimensions):
   operand_avals, init_val_avals = split_list(avals, [len(avals) // 2])
   operand_dtypes = [dtypes.canonicalize_dtype(op.dtype) for op in operand_avals]
   init_val_dtypes = [dtypes.canonicalize_dtype(init.dtype) for init in init_val_avals]
@@ -3679,13 +3684,13 @@ def _reduce_dtype_rule(*avals, computation, jaxpr, consts, dimensions):
         f"got operands={operand_avals} and initial_values={init_val_avals}")
   return operand_dtypes
 
-def _reduce_weak_type_rule(*avals, computation, jaxpr, consts, dimensions):
+def _reduce_weak_type_rule(*avals, computation, jaxpr, dimensions):
   operand_avals, init_val_avals = split_list(avals, [len(avals) // 2])
   return [op.weak_type and init_val.weak_type
           for op, init_val in safe_zip(operand_avals, init_val_avals)]
 
 def _reduce_batch_rule(batched_args, batch_dims, *, computation, jaxpr,
-                       consts, dimensions):
+                       dimensions):
   # TODO(mattjj,frostig): use batch_jaxpr, delete computation (assumes poly??)
   num_operands = len(batched_args) // 2
   operands, init_values = split_list(batched_args, [num_operands])
@@ -3701,7 +3706,6 @@ def _reduce_batch_rule(batched_args, batch_dims, *, computation, jaxpr,
     return reduce_p.bind(*(operands + init_values),
                          computation=computation,
                          dimensions=tuple(new_dimensions),
-                         consts=consts,
                          jaxpr=jaxpr), new_operand_bdims
   else:
     raise NotImplementedError  # loop and stack
@@ -3739,8 +3743,7 @@ def _reduce_jvp(reducer, init_values, primals, tangents, axes):
 
   return api.jvp(_reduce_tree, primals, tangents)
 
-def _reduce_jvp_rule(primals, tangents, *, computation, jaxpr,
-                     consts, dimensions):
+def _reduce_jvp_rule(primals, tangents, *, computation, jaxpr, dimensions):
   primal_xs, init_values = split_list(primals, [len(primals) // 2])
   tangent_xs, tangent_init = split_list(tangents, [len(tangents) // 2])
   # This test may be too strict, if a value is actually zero but we cannot prove
@@ -3749,10 +3752,10 @@ def _reduce_jvp_rule(primals, tangents, *, computation, jaxpr,
     raise NotImplementedError(
       "Gradient of general lax.reduce with non-zero tangents for "
       "initial values to reduction not implemented")
-  reducer = core.jaxpr_as_fun(core.ClosedJaxpr(jaxpr, consts))
+  reducer = core.jaxpr_as_fun(jaxpr)
   return _reduce_jvp(reducer, init_values, primal_xs, tangent_xs, dimensions)
 
-def _reduce_named_shape_rule(*avals, computation, jaxpr, consts, dimensions):
+def _reduce_named_shape_rule(*avals, computation, jaxpr, dimensions):
   # TODO(mattjj,frostig): see the TODOs noting limitations/assumptions in
   # _reduce_batching_rule. We're making the same assumptions here for now.
   num_operands = len(avals) // 2
@@ -3774,7 +3777,7 @@ reduce_p.def_abstract_eval(
 batching.primitive_batchers[reduce_p] = _reduce_batch_rule
 ad.primitive_jvps[reduce_p] = _reduce_jvp_rule
 
-def _reduce_lower(ctx, *values, computation, jaxpr, consts, dimensions):
+def _reduce_lower(ctx, *values, computation, jaxpr, dimensions):
   assert all(isinstance(x, core.ShapedArray) for x in ctx.avals_in), ctx.avals_in
   operands, init_values = util.split_list(values, [len(values) // 2])
   init_value_avals = ctx.avals_in[len(values) // 2:]
@@ -3787,7 +3790,8 @@ def _reduce_lower(ctx, *values, computation, jaxpr, consts, dimensions):
         name_stack=source_info_util.new_name_stack())
     if jaxpr.effects:
       raise NotImplementedError('Cannot lower effectful `reduce`.')
-    out_nodes, _ = mlir.jaxpr_subcomp(reducer_ctx, jaxpr, mlir.TokenSet(), consts,
+    out_nodes, _ = mlir.jaxpr_subcomp(reducer_ctx, jaxpr.jaxpr, mlir.TokenSet(),
+                                      jaxpr.consts,
                                       *([a] for a in reducer.arguments),
                                       dim_var_values=ctx.dim_var_values)
     hlo.return_(util.flatten(out_nodes))
@@ -4743,8 +4747,9 @@ def padtype_to_pads(in_shape, window_shape, window_strides, padding):
 
   if padding == PaddingType.SAME or padding == PaddingType.SAME_LOWER:
     out_shape = _ceil_divide(in_shape, window_strides)
-    pad_sizes = np.maximum(0, (out_shape - 1) * window_strides +
-                                window_shape - in_shape)
+    pad_sizes = (core.max_dim(d, 0)
+                 for d in (out_shape - 1) * window_strides +
+                          window_shape - in_shape)
     if padding == PaddingType.SAME:
       return [
           (pad_size // 2, pad_size - pad_size // 2) for pad_size in pad_sizes
@@ -5011,5 +5016,13 @@ class BIntRules:
   @staticmethod
   def physical_hlo_sharding(aval, hlo_sharding: xc.HloSharding) -> xc.HloSharding:
     return hlo_sharding
+
+  @staticmethod
+  def convert_from(bint_dtype, other_dtype) -> bool:
+    return other_dtype in (np.dtype('int32'), np.dtype('int64'))
+
+  @staticmethod
+  def convert_to(other_dtype, bint_dtype) -> bool:
+    return other_dtype in (np.dtype('int32'), np.dtype('int64'))
 
 core.bint._rules = BIntRules

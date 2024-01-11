@@ -43,6 +43,12 @@ parser.add_argument(
     help="Path to which the output wheel should be written. Required.",
 )
 parser.add_argument(
+    "--jaxlib_git_hash",
+    default="",
+    required=True,
+    help="Git hash. Empty if unknown. Optional.",
+)
+parser.add_argument(
     "--cpu", default=None, required=True, help="Target CPU architecture. Required."
 )
 parser.add_argument(
@@ -192,7 +198,6 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
           "__main__/jaxlib/gpu_common_utils.py",
           "__main__/jaxlib/gpu_solver.py",
           "__main__/jaxlib/gpu_sparse.py",
-          "__main__/jaxlib/tpu_mosaic.py",
           "__main__/jaxlib/version.py",
           "__main__/jaxlib/xla_client.py",
           f"__main__/jaxlib/xla_extension.{pyext}",
@@ -247,8 +252,6 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
   copy_runfiles(
       dst_dir=mosaic_python_dir,
       src_files=[
-          "__main__/jaxlib/mosaic/python/apply_vector_layout.py",
-          "__main__/jaxlib/mosaic/python/infer_memref_layout.py",
           "__main__/jaxlib/mosaic/python/layout_defs.py",
           "__main__/jaxlib/mosaic/python/tpu.py",
       ],
@@ -296,6 +299,12 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
           "__main__/jaxlib/mlir/dialects/vector.py",
       ],
   )
+  copy_runfiles(
+      dst_dir=jaxlib_dir / "mlir" / "extras",
+      src_files=[
+          "__main__/jaxlib/mlir/extras/meta.py",
+      ],
+  )
 
   if build_utils.is_windows():
     capi_so = "__main__/jaxlib/mlir/_mlir_libs/jaxlib_mlir_capi.dll"
@@ -338,7 +347,7 @@ try:
   if args.editable:
     build_utils.build_editable(sources_path, args.output_path, package_name)
   else:
-    build_utils.build_wheel(sources_path, args.output_path, package_name)
+    build_utils.build_wheel(sources_path, args.output_path, package_name, git_hash=args.jaxlib_git_hash)
 finally:
   if tmpdir:
     tmpdir.cleanup()

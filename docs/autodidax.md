@@ -6,7 +6,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.15.2
+    jupytext_version: 1.16.0
 kernelspec:
   display_name: Python 3
   name: python3
@@ -1524,7 +1524,7 @@ xla_call_p = Primitive('xla_call')
 
 With any new primitive, we need to give it transformation rules, starting with
 its evaluation rule. When we evaluate an application of the `xla_call`
-primitive, we want to stage out out the computation to XLA. That involves
+primitive, we want to stage out the computation to XLA. That involves
 translating the jaxpr to an XLA HLO program, transferring the argument values
 to the XLA device, executing the XLA program, and transferring back the
 results. We'll cache the XLA HLO compilation so that for each `jit`ted

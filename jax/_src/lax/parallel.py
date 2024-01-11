@@ -15,12 +15,13 @@
 Parallelization primitives.
 """
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from functools import partial
 import itertools
 import math
 import string
-from typing import Union
 
 import numpy as np
 
@@ -287,7 +288,7 @@ def pshuffle(x, axis_name, perm):
     x: array(s) with a mapped axis named ``axis_name``.
     axis_name: hashable Python object used to name a pmapped axis (see the
       :func:`jax.pmap` documentation for more details).
-    perm: list of of ints encoding sources for the permutation to be applied to
+    perm: list of ints encoding sources for the permutation to be applied to
       the axis named ``axis_name``, so that the output at axis index i
       comes from the input at axis index perm[i]. Every integer in [0, N) should
       be included exactly once for axis size N.
@@ -606,7 +607,7 @@ class XeinsumSpecParser:
     return arg_specs
 
 
-def pgather(src, idx, axes: Union[int, AxisName]):
+def pgather(src, idx, axes: int | AxisName):
   """Uses the last positional axis of idx to index into src's axes."""
   if not isinstance(axes, (tuple, list)):
     axes = (axes,)

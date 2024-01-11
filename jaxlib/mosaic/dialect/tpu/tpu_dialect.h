@@ -23,6 +23,7 @@ limitations under the License.
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/include/mlir/IR/BuiltinOps.h"
 #include "mlir/include/mlir/IR/BuiltinTypes.h"
 #include "mlir/include/mlir/IR/Value.h"
 #include "mlir/include/mlir/Support/LogicalResult.h"
@@ -50,18 +51,23 @@ namespace tpu {
 std::pair<bool, bool> mightCommunicateBetweenChips(Operation* op);
 
 std::unique_ptr<OperationPass<func::FuncOp>> createInferMemRefLayoutPass(
-    int hardware_generation);
+    int hardware_generation = -1);
 
 std::unique_ptr<OperationPass<func::FuncOp>> createInferVectorLayoutPass(
     int lane_count = 128, int sublane_count = 8);
 
 std::unique_ptr<OperationPass<func::FuncOp>> createApplyVectorLayoutPass(
-    int hardware_generation, int lane_count = 128, int sublane_count = 8);
+    int hardware_generation = -1, int lane_count = 128, int sublane_count = 8);
 
 std::unique_ptr<OperationPass<func::FuncOp>>
 createLogicalToPhysicalDeviceIdPass(int64_t total_devices);
 
 std::unique_ptr<OperationPass<func::FuncOp>> createLinalgVectorizationPass();
+
+std::unique_ptr<OperationPass<func::FuncOp>> createDebugAssertInsertionPass();
+
+#define GEN_PASS_DECL_MOSAICSERDEPASS
+#include "jaxlib/mosaic/dialect/tpu/tpu_passes.h.inc"
 
 // Changes the memory space of the value and propagates it through the program.
 LogicalResult specializeMemorySpace(TypedValue<MemRefType> value,

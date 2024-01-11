@@ -27,30 +27,29 @@ import numpy as np
 
 import jax
 from jax import lax
-from jax.experimental.export import export
+from jax.experimental.export import _export
 from jax._src.internal_test_util import export_back_compat_test_util as bctu
 
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_ducc_fft
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_cholesky_lapack_potrf
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_eig_lapack_geev
-from jax.experimental.jax2tf.tests.back_compat_testdata import cuda_eigh_cusolver_syev
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_eigh_lapack_syev
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_lu_lapack_getrf
-from jax.experimental.jax2tf.tests.back_compat_testdata import cuda_qr_cusolver_geqrf
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_qr_lapack_geqrf
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_schur_lapack_gees
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_svd_lapack_gesdd
-from jax.experimental.jax2tf.tests.back_compat_testdata import cpu_triangular_solve_blas_trsm
-from jax.experimental.jax2tf.tests.back_compat_testdata import cuda_threefry2x32
-from jax.experimental.jax2tf.tests.back_compat_testdata import tf_call_tf_function
-from jax.experimental.jax2tf.tests.back_compat_testdata import tpu_Eigh
-from jax.experimental.jax2tf.tests.back_compat_testdata import tpu_Lu
-from jax.experimental.jax2tf.tests.back_compat_testdata import tpu_ApproxTopK
-from jax.experimental.jax2tf.tests.back_compat_testdata import tpu_Qr
-from jax.experimental.jax2tf.tests.back_compat_testdata import tpu_Sharding
-from jax.experimental.jax2tf.tests.back_compat_testdata import tpu_stablehlo_dynamic_reduce_window
-from jax.experimental.jax2tf.tests.back_compat_testdata import stablehlo_dynamic_rng_bit_generator
-from jax.experimental.jax2tf.tests.back_compat_testdata import stablehlo_dynamic_top_k
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_ducc_fft
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_cholesky_lapack_potrf
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_eig_lapack_geev
+from jax._src.internal_test_util.export_back_compat_test_data import cuda_eigh_cusolver_syev
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_eigh_lapack_syev
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_lu_lapack_getrf
+from jax._src.internal_test_util.export_back_compat_test_data import cuda_qr_cusolver_geqrf
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_qr_lapack_geqrf
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_schur_lapack_gees
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_svd_lapack_gesdd
+from jax._src.internal_test_util.export_back_compat_test_data import cpu_triangular_solve_blas_trsm
+from jax._src.internal_test_util.export_back_compat_test_data import cuda_threefry2x32
+from jax._src.internal_test_util.export_back_compat_test_data import tpu_Eigh
+from jax._src.internal_test_util.export_back_compat_test_data import tpu_Lu
+from jax._src.internal_test_util.export_back_compat_test_data import tpu_ApproxTopK
+from jax._src.internal_test_util.export_back_compat_test_data import tpu_Qr
+from jax._src.internal_test_util.export_back_compat_test_data import tpu_Sharding
+from jax._src.internal_test_util.export_back_compat_test_data import tpu_stablehlo_dynamic_reduce_window
+from jax._src.internal_test_util.export_back_compat_test_data import stablehlo_dynamic_rng_bit_generator
+from jax._src.internal_test_util.export_back_compat_test_data import stablehlo_dynamic_top_k
 
 from jax.experimental import pjit
 from jax.experimental.shard_map import shard_map
@@ -61,11 +60,13 @@ from jax.sharding import PartitionSpec as P
 
 from jax._src import config
 from jax._src import test_util as jtu
+from jax._src.lib import version as jaxlib_version
 
 config.parse_flags_with_absl()
 
 
-@jtu.with_config(jax_legacy_prng_key='allow')
+@jtu.with_config(jax_legacy_prng_key='allow',
+                 jax_enable_key_reuse_checks=False)
 class CompatTest(bctu.CompatTestBase):
   def test_dummy(self):
     # Tests the testing mechanism. Let this test run on all platforms
@@ -96,7 +97,7 @@ class CompatTest(bctu.CompatTestBase):
 
   def test_custom_call_coverage(self):
     """Tests that the back compat tests cover all the targets declared stable."""
-    targets_to_cover = set(export._CUSTOM_CALL_TARGETS_GUARANTEED_STABLE)
+    targets_to_cover = set(_export._CUSTOM_CALL_TARGETS_GUARANTEED_STABLE)
     # Add here all the testdatas that should cover the targets guaranteed
     # stable
     covering_testdatas = [
@@ -110,7 +111,6 @@ class CompatTest(bctu.CompatTestBase):
         cpu_schur_lapack_gees.data_2023_07_16,
         cpu_svd_lapack_gesdd.data_2023_06_19,
         cpu_triangular_solve_blas_trsm.data_2023_07_16,
-        tf_call_tf_function.data_2023_07_29,  # This is tested in back_compat_tf_test.py
         tpu_Eigh.data, tpu_Lu.data_2023_03_21, tpu_Qr.data_2023_03_17,
         tpu_Sharding.data_2023_03_16, tpu_ApproxTopK.data_2023_04_17,
         tpu_ApproxTopK.data_2023_05_16,
@@ -129,6 +129,7 @@ class CompatTest(bctu.CompatTestBase):
       covered_targets = covered_targets.union(data.custom_call_targets)
 
     covered_targets = covered_targets.union({
+      "tf.call_tf_function",  # tested in jax2tf/tests/back_compat_tf_test.py
       "tpu_custom_call",  # tested separately
     })
     not_covered = targets_to_cover.difference(covered_targets)
@@ -143,14 +144,21 @@ class CompatTest(bctu.CompatTestBase):
 
     # An old lowering, with ducc_fft. We keep it for 6 months.
     data = self.load_testdata(cpu_ducc_fft.data_2023_03_17)
-    # We have changed the lowering for fft since we saved this data.
-    # FFT no longer lowers to a custom call.
-    self.run_one_test(func, data, expect_current_custom_calls=[])
+    if jaxlib_version <= (0, 4, 20):
+      expect_current_custom_calls = ["dynamic_ducc_fft"]
+    else:
+      # We have changed the lowering for fft since we saved this data.
+      # FFT no longer lowers to a custom call.
+      expect_current_custom_calls = []
+
+    self.run_one_test(func, data,
+                      expect_current_custom_calls=expect_current_custom_calls)
 
     # A newer lowering, with dynamic_ducc_fft.
     data = self.load_testdata(cpu_ducc_fft.data_2023_06_14)
     # FFT no longer lowers to a custom call.
-    self.run_one_test(func, data, expect_current_custom_calls=[])
+    self.run_one_test(func, data,
+                      expect_current_custom_calls=expect_current_custom_calls)
 
   def cholesky_input(self, shape, dtype):
     a = jtu.rand_default(self.rng())(shape, dtype)
@@ -293,6 +301,8 @@ class CompatTest(bctu.CompatTestBase):
       # We use different custom calls for sizes <= 32
       for variant in ["syevj", "syevd"])
   def test_cuda_eigh_cusolver_syev(self, dtype_name="f32", variant="syevj"):
+    if not config.enable_x64.value and dtype_name == "f64":
+      self.skipTest("Test disabled for x32 mode")
     # For lax.linalg.eigh
     dtype = dict(f32=np.float32, f64=np.float64)[dtype_name]
     size = dict(syevj=8, syevd=36)[variant]
@@ -645,6 +655,9 @@ class CompatTest(bctu.CompatTestBase):
         # Recent serializations also include shape_assertion, tested with dynamic_top_k
         expect_current_custom_calls=["stablehlo.dynamic_reduce_window", "shape_assertion"])
 
+  @jtu.ignore_warning(
+      category=FutureWarning,
+      message="Raw arrays as random keys to jax.random functions are deprecated")
   def test_stablehlo_dynamic_rbg_bit_generator(self):
     # stablehlo.dynamic_rbg_bit_generator is used temporarily for a
     # rbg_bit_generator with dynamic shapes.

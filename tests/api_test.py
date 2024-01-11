@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
 import collections
 import collections.abc
@@ -32,7 +33,7 @@ import re
 import subprocess
 import sys
 import types
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple
 import unittest
 import weakref
 
@@ -4379,6 +4380,77 @@ class APITest(jtu.JaxTestCase):
           tracing_add_count += 1
       self.assertEqual(tracing_add_count, 2)
 
+  def test_cache_miss_explanations(self):
+    @jax.jit
+    def f(x, y):
+      return jnp.sin(x) * y['hi']
+
+    x = jnp.float32(1.)
+    y = {'hi': jnp.arange(3., dtype='float32')}
+
+    # print on first miss, not on hit
+    with config.explain_cache_misses(True):
+      with self.assertLogs(level='WARNING') as cm:
+        f(x, y)
+        f(x, y)
+    self.assertLen(cm.output, 1)
+    msg, = cm.output
+    self.assertIn('TRACING CACHE MISS', msg)
+    self.assertIn('never seen function', msg)
+
+    # shape change
+    y_ = {'hi': jnp.arange(4, dtype='float32')}
+    with config.explain_cache_misses(True):
+      with self.assertLogs(level='WARNING') as cm:
+        f(x, y_)
+    self.assertLen(cm.output, 1)
+    msg, = cm.output
+    self.assertIn('never seen input type signature', msg)
+    self.assertIn('closest seen input type signature has 1 mismatches', msg)
+    self.assertIn('seen f32[3], but now given f32[4]', msg)
+
+    # weak type change (assuming no x64)
+    if not config.enable_x64.value:
+      with config.explain_cache_misses(True):
+        with self.assertLogs(level='WARNING') as cm:
+          f(1., y)
+      self.assertLen(cm.output, 1)
+      msg, = cm.output
+      self.assertIn('weak_type=True', msg)
+      self.assertIn('https://jax.readthedocs.io/en/latest/type_promotion.html#weak-types', msg)
+
+    # kwarg change
+    with config.explain_cache_misses(True):
+      with self.assertLogs(level='WARNING') as cm:
+        f(1, y=y)
+    self.assertLen(cm.output, 1)
+    msg, = cm.output
+    self.assertIn('never seen passing 1 positional args and 1 keyword args', msg)
+
+    # tracing config change
+    with config.explain_cache_misses(True):
+      with self.assertLogs(level='WARNING') as cm:
+        with jax.numpy_rank_promotion('warn'):
+          f(x, y)
+    self.assertLen(cm.output, 1)
+    msg, = cm.output
+    self.assertIn("tracing context doesn't match", msg)
+
+  def test_cache_miss_explanations_new_function_in_loop(self):
+    @jax.jit
+    def f(x, y):
+      return jnp.sin(x) * y['hi']
+
+    x = jnp.float32(1.)
+
+    with config.explain_cache_misses(True):
+      with self.assertLogs(level='WARNING') as cm:
+        for _ in range(2):
+          jax.jit(lambda x: 2 * x)(3)
+    self.assertLen(cm.output, 2)
+    _, msg = cm.output
+    self.assertIn('another function defined on the same line', msg)
+
   @parameterized.named_parameters([
       {"testcase_name": f"{dtype}", "dtype": dtype}
       for dtype in jtu.dtypes.custom_floats])
@@ -6071,6 +6143,7 @@ class RematTest(jtu.JaxTestCase):
     self.assertTrue(any(' cos ' in line for line in l.output))
 
 
+@jtu.with_config(jax_pprint_use_color=False)
 class JaxprTest(jtu.JaxTestCase):
 
   def test_scalar_literals(self):
@@ -6226,7 +6299,7 @@ class DCETest(jtu.JaxTestCase):
 
   def assert_dce_result(self, jaxpr: core.Jaxpr, used_outputs: list[bool],
                         expected_used_inputs: list[bool],
-                        expected_num_eqns: Optional[int] = None,
+                        expected_num_eqns: int | None = None,
                         check_diff: bool = True):
     jaxpr_dce, used_inputs = pe.dce_jaxpr(jaxpr, used_outputs)
     core.check_jaxpr(jaxpr_dce)
@@ -8082,7 +8155,7 @@ class CustomVJPTest(jtu.JaxTestCase):
 
   def test_nondiff_arg_tracer_error(self):
     # This is similar to the old (now skipped) test_nondiff_arg_tracer, except
-    # we're testing for the error message that that usage pattern now raises.
+    # we're testing for the error message that usage pattern now raises.
 
     @partial(jax.custom_vjp, nondiff_argnums=(0,))
     def f(x, y):

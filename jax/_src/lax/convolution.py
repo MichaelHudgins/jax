@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from functools import partial
 import operator
-from typing import NamedTuple, Optional, Union
+from typing import NamedTuple, Union
 
 import numpy as np
 
@@ -46,17 +48,20 @@ class ConvDimensionNumbers(NamedTuple):
   out_spec: Sequence[int]
 
 ConvGeneralDilatedDimensionNumbers = Union[
-  None, ConvDimensionNumbers, tuple[str, str, str]]
+    tuple[str, str, str],
+    ConvDimensionNumbers,
+    None,
+]
 
 def conv_general_dilated(
   lhs: Array, rhs: Array, window_strides: Sequence[int],
-  padding: Union[str, Sequence[tuple[int, int]]],
-  lhs_dilation: Optional[Sequence[int]] = None,
-  rhs_dilation: Optional[Sequence[int]] = None,
+  padding: str | Sequence[tuple[int, int]],
+  lhs_dilation: Sequence[int] | None = None,
+  rhs_dilation: Sequence[int] | None = None,
   dimension_numbers: ConvGeneralDilatedDimensionNumbers  = None,
   feature_group_count: int = 1, batch_group_count: int = 1,
   precision: lax.PrecisionLike = None,
-  preferred_element_type: Optional[DTypeLike] = None) -> Array:
+  preferred_element_type: DTypeLike | None = None) -> Array:
   """General n-dimensional convolution operator, with optional dilation.
 
   Wraps XLA's `Conv
@@ -137,7 +142,7 @@ def conv_general_dilated(
   if isinstance(padding, str):
     lhs_perm, rhs_perm, _ = dnums
     rhs_shape = np.take(rhs.shape, rhs_perm)[2:]  # type: ignore[index]
-    effective_rhs_shape = [(k-1) * r + 1 for k, r in zip(rhs_shape, rhs_dilation)]
+    effective_rhs_shape = [core.dilate_dim(k, r) for k, r in zip(rhs_shape, rhs_dilation)]
     padding = lax.padtype_to_pads(
         np.take(lhs.shape, lhs_perm)[2:], effective_rhs_shape,  # type: ignore[index]
         window_strides, padding)
@@ -168,7 +173,7 @@ def conv_general_dilated(
 
 def conv(lhs: Array, rhs: Array, window_strides: Sequence[int],
          padding: str, precision: lax.PrecisionLike = None,
-         preferred_element_type: Optional[DTypeLike] = None) -> Array:
+         preferred_element_type: DTypeLike | None = None) -> Array:
   """Convenience wrapper around `conv_general_dilated`.
 
   Args:
@@ -194,11 +199,11 @@ def conv(lhs: Array, rhs: Array, window_strides: Sequence[int],
 
 def conv_with_general_padding(lhs: Array, rhs: Array,
                               window_strides: Sequence[int],
-                              padding: Union[str, Sequence[tuple[int, int]]],
-                              lhs_dilation: Optional[Sequence[int]],
-                              rhs_dilation: Optional[Sequence[int]],
+                              padding: str | Sequence[tuple[int, int]],
+                              lhs_dilation: Sequence[int] | None,
+                              rhs_dilation: Sequence[int] | None,
                               precision: lax.PrecisionLike = None,
-                              preferred_element_type: Optional[DTypeLike] = None) -> Array:
+                              preferred_element_type: DTypeLike | None = None) -> Array:
   """Convenience wrapper around `conv_general_dilated`.
 
   Args:
@@ -266,12 +271,12 @@ def _flip_axes(x, axes):
 
 
 def conv_transpose(lhs: Array, rhs: Array, strides: Sequence[int],
-                   padding: Union[str, Sequence[tuple[int, int]]],
-                   rhs_dilation: Optional[Sequence[int]] = None,
+                   padding: str | Sequence[tuple[int, int]],
+                   rhs_dilation: Sequence[int] | None = None,
                    dimension_numbers: ConvGeneralDilatedDimensionNumbers = None,
                    transpose_kernel: bool = False,
                    precision: lax.PrecisionLike = None,
-                   preferred_element_type: Optional[DTypeLike] = None) -> Array:
+                   preferred_element_type: DTypeLike | None = None) -> Array:
   """Convenience wrapper for calculating the N-d convolution "transpose".
 
   This function directly calculates a fractionally strided conv rather than
@@ -325,11 +330,11 @@ def conv_transpose(lhs: Array, rhs: Array, strides: Sequence[int],
   k_shape = np.take(rhs.shape, dn.rhs_spec)
   k_sdims = k_shape[2:]  # type: ignore[index]
   # Calculate correct output shape given padding and strides.
-  pads: Union[str, Sequence[tuple[int, int]]]
+  pads: str | Sequence[tuple[int, int]]
   if isinstance(padding, str) and padding in {'SAME', 'VALID'}:
     if rhs_dilation is None:
       rhs_dilation = (1,) * (rhs.ndim - 2)
-    effective_k_size = map(lambda k, r: (k-1) * r + 1, k_sdims, rhs_dilation)
+    effective_k_size = map(lambda k, r: core.dilate_dim(k, r), k_sdims, rhs_dilation)
     pads = [_conv_transpose_padding(k, s, padding)
             for k,s in zip(effective_k_size, strides)]
   else:

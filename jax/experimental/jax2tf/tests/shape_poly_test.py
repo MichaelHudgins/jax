@@ -13,10 +13,12 @@
 # limitations under the License.
 """Tests for the shape-polymorphic jax2tf conversion."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 import contextlib
 import math
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable
 import unittest
 
 from absl import logging
@@ -30,7 +32,7 @@ import re
 
 import jax
 from jax.experimental import jax2tf
-from jax.experimental.export import export
+from jax.experimental import export
 from jax.experimental.export import shape_poly
 from jax.experimental import pjit
 from jax import lax
@@ -80,14 +82,14 @@ class PolyHarness(Harness):
                fun: Callable,
                *,
                arg_descriptors: Sequence[test_harnesses.ArgDescriptor] = (),
-               polymorphic_shapes: Sequence[Optional[str]] = (),
-               input_signature: Optional[Sequence[tf.TensorSpec]] = None,
-               expected_output_signature: Optional[tf.TensorSpec] = None,
+               polymorphic_shapes: Sequence[str | None] = (),
+               input_signature: Sequence[tf.TensorSpec] | None = None,
+               expected_output_signature: tf.TensorSpec | None = None,
                enable_xla: bool = True,
-               expect_error: tuple[Optional[Any], Optional[str]] = (None, None),
+               expect_error: tuple[Any | None, str | None] = (None, None),
                skip_jax_run: bool = False,
                check_result: bool = True,
-               tol: Optional[float] = None,
+               tol: float | None = None,
                limitations: Sequence[Jax2TfLimitation] = (),
                override_jax_config_flags: dict[str, Any] = {}):
     """Args:
@@ -129,7 +131,7 @@ class PolyHarness(Harness):
     self.override_jax_config_flags = override_jax_config_flags
 
   # Replicate the harness for both enable and disable xla
-  def both_enable_and_disable_xla(self) -> tuple["PolyHarness", "PolyHarness"]:
+  def both_enable_and_disable_xla(self) -> tuple[PolyHarness, PolyHarness]:
     assert self.enable_xla
     other = PolyHarness(self.group_name,
                         f"{self.name}_enable_xla_False",
@@ -144,7 +146,7 @@ class PolyHarness(Harness):
     self.name = f"{self.name}_enable_xla_True"
     return (self, other)
 
-  def run_test(self, tst: tf_test_util.JaxToTfTestCase) -> Optional[jax.Array]:
+  def run_test(self, tst: tf_test_util.JaxToTfTestCase) -> jax.Array | None:
     def log_message(extra: str):
       return f"[{tst._testMethodName}]: {extra}"
 
@@ -243,10 +245,10 @@ class PolyHarness(Harness):
 def check_shape_poly(tst, f_jax: Callable, *,
                      arg_descriptors: Sequence[test_harnesses.ArgDescriptor] = (),
                      skip_jax_run: bool = False,
-                     polymorphic_shapes: Sequence[Optional[str]] = (),
-                     input_signature: Optional[Sequence[tf.TensorSpec]] = None,
-                     expected_output_signature: Optional[tf.TensorSpec] = None,
-                     expect_error=(None, None)) -> Optional[jax.Array]:
+                     polymorphic_shapes: Sequence[str | None] = (),
+                     input_signature: Sequence[tf.TensorSpec] | None = None,
+                     expected_output_signature: tf.TensorSpec | None = None,
+                     expect_error=(None, None)) -> jax.Array | None:
   # Makes and tests a harness. See PolyHarness documentation.
   h = PolyHarness("", "", f_jax,
                   arg_descriptors=arg_descriptors,
@@ -427,10 +429,10 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
   def test_arg_avals_non_native(self):
     """Test conversion of actual arguments to abstract values."""
 
-    def check_avals(*, arg_shapes: Sequence[Sequence[Optional[int]]],
-                    polymorphic_shapes: Sequence[Optional[Union[str, PS]]],
-                    expected_avals: Optional[Sequence[core.ShapedArray]] = None,
-                    expected_shapeenv: Optional[dict[str, int]] = None,
+    def check_avals(*, arg_shapes: Sequence[Sequence[int | None]],
+                    polymorphic_shapes: Sequence[str | PS | None],
+                    expected_avals: Sequence[core.ShapedArray] | None = None,
+                    expected_shapeenv: dict[str, int] | None = None,
                     eager_mode: bool = False):
       # Use eager mode only for when all arg_shapes are known, in order to
       # check expected_shapeenv.
@@ -438,7 +440,7 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
       def f_tf(*args_tf):
         avals = tuple(map(
             lambda s, dt, spec: core.ShapedArray(
-                shape_poly.symbolic_shape(spec, like=s),
+                export.symbolic_shape(spec, like=s),
                 dt),
             arg_shapes, arg_dtypes, polymorphic_shapes))
         dim_vars = shape_poly.all_dim_vars(avals)
@@ -466,7 +468,7 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
 
     def shaped_array(shape_spec: str, actual_shape: core.Shape):
       return core.ShapedArray(
-          shape_poly.symbolic_shape(shape_spec, like=actual_shape), np.float32)
+          export.symbolic_shape(shape_spec, like=actual_shape), np.float32)
 
     # Known shapes for the arguments
     check_avals(
@@ -602,9 +604,9 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
            expect_error=(
              "Input shapes do not match the polymorphic shapes specification. "
              "Expected value >= 1 for dimension variable 'b'. "
-             "Using the following polymorphic shapes specifications: args[0].shape = (a + 2*b, a, a + b + c). "
+             "Using the following polymorphic shapes specifications: args[0].shape = (2*b + a, a, c + b + a). "
              "Obtained dimension variables: 'a' = 2 from specification 'a' for dimension args[0].shape[1] (= 2), "
-             "'b' = 0 from specification 'a + 2*b' for dimension args[0].shape[0] (= 2), . "
+             "'b' = 0 from specification '2*b + a' for dimension args[0].shape[0] (= 2), . "
              "Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#shape-assertion-errors for more details."
            )),
       dict(shape=(3, 2, 6),  # a = 2, b = 0.5, c = 4 - b is not integer
@@ -612,7 +614,7 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
            expect_error=(
              "Input shapes do not match the polymorphic shapes specification. "
              "Division had remainder 1 when computing the value of 'b'. "
-             "Using the following polymorphic shapes specifications: args[0].shape = (a + 2*b, a, a + b + c). "
+             "Using the following polymorphic shapes specifications: args[0].shape = (2*b + a, a, c + b + a). "
              "Obtained dimension variables: 'a' = 2 from specification 'a' for dimension args[0].shape[1] (= 2), . "
              "Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#shape-assertion-errors for more details."
            )),
@@ -620,10 +622,10 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
            poly_spec="(a + 2*b, a, a + b)",
            expect_error=(
              "Input shapes do not match the polymorphic shapes specification. "
-             "Found inconsistency between dimension size args[0].shape[0] (= 8) and the specification 'a + 2*b' (= 10). "
-             "Using the following polymorphic shapes specifications: args[0].shape = (a + 2*b, a, a + b). "
+             "Found inconsistency between dimension size args[0].shape[0] (= 8) and the specification '2*b + a' (= 10). "
+             "Using the following polymorphic shapes specifications: args[0].shape = (2*b + a, a, b + a). "
              "Obtained dimension variables: 'a' = 2 from specification 'a' for dimension args[0].shape[1] (= 2), "
-             "'b' = 4 from specification 'a + b' for dimension args[0].shape[2] (= 6), . "
+             "'b' = 4 from specification 'b + a' for dimension args[0].shape[2] (= 6), . "
              "Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#shape-assertion-errors for more details."
            )),
       dict(shape=(7, 2, 36),  # a = 2, b = 3, c = 6 - cannot solve c
@@ -631,13 +633,13 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
            expect_error=(
              "Cannot solve for values of dimension variables {'c'}. "
              "We can only solve linear uni-variate constraints. "
-             "Using the following polymorphic shapes specifications: args[0].shape = (2*a + b, a, c^2). "
+             "Using the following polymorphic shapes specifications: args[0].shape = (b + 2*a, a, c^2). "
              "Unprocessed specifications: 'c^2' for dimension size args[0].shape[2]. "
              "Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#dimension-variables-must-be-solvable-from-the-input-shapes for more details."
            )),
   ])
   def test_shape_constraints_errors(self, *,
-      shape, poly_spec: str, expect_error: Optional[str] = None):
+      shape, poly_spec: str, expect_error: str | None = None):
     def f_jax(x):  # x: f32[a + 2*b, a, a + b + c]
       return 0.
 
@@ -1441,7 +1443,7 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
     traced = False
     # If we get_concrete_function we trace once
     f_tf = tf.function(
-        jax2tf.convert(f_jax, polymorphic_shapes=[PS("b", ...)]),
+        jax2tf.convert(f_jax, polymorphic_shapes=["b, ..."]),
         autograph=False,
         jit_compile=True).get_concrete_function(
             tf.TensorSpec([None, 2, 3], x.dtype))
@@ -1499,7 +1501,7 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
         polymorphic_shapes=[x_polymorphic_shape, y_polymorphic_shape])(x, y)
     self.assertEqual(np.float32, zw_specs[0].dtype)
     self.assertEqual(np.float32, zw_specs[1].dtype)
-    self.assertEqual(("(a, 5)", "(a + b, 5)"), zw_polymorphic_shapes)
+    self.assertEqual(("(a, 5)", "(b + a, 5)"), zw_polymorphic_shapes)
 
     # We can use the zw_polymorphic_shapes for jax2tf.convert
     z, w = jax2tf.convert(
@@ -2622,7 +2624,7 @@ def _make_vmap_primitive_harnesses() -> Sequence[PolyHarness]:
       continue
 
     def make_batched_arg_descriptor(
-        ad: test_harnesses.ArgDescriptor) -> Optional[test_harnesses.ArgDescriptor]:
+        ad: test_harnesses.ArgDescriptor) -> test_harnesses.ArgDescriptor | None:
       if isinstance(ad, RandArg):
         return RandArg((batch_size,) + ad.shape, ad.dtype)
       elif isinstance(ad, CustomArg):

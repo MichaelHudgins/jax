@@ -26,9 +26,9 @@ from jax._src import config
 from jax._src import core
 from jax._src import source_info_util
 from jax._src import linear_util as lu
-from jax._src.ad_util import (add_jaxvals, add_jaxvals_p, zeros_like_jaxval,
-                              zeros_like_p, Zero, SymbolicZero,
-                              replace_rule_output_symbolic_zeros, instantiate)
+from jax._src.ad_util import (Zero, instantiate, SymbolicZero,
+                              replace_rule_output_symbolic_zeros,
+                              add_jaxvals, add_jaxvals_p)
 from jax._src.core import raise_to_shaped, Trace, Tracer, AxisName
 from jax._src.interpreters import partial_eval as pe
 from jax._src.tree_util import (tree_unflatten, tree_flatten,
@@ -966,7 +966,10 @@ def _matchaxis_symbolic_zeros(axis_name, sz, name, src, dst, x, sum_match=False)
 
 ### utilities for defining primitives' batching rules
 
-BatchingRule = Callable[..., tuple[Any, Union[None, int, tuple[Union[None, int], ...]]]]
+BatchingRule = Callable[
+    ...,
+    tuple[Any, Union[int, None, tuple[Union[int, None], ...]]]
+]
 primitive_batchers : dict[core.Primitive, BatchingRule] = {}
 axis_primitive_batchers: dict[core.Primitive, Callable] = {}
 spmd_axis_primitive_batchers: dict[core.Primitive, Callable] = {}
@@ -1124,7 +1127,6 @@ def bdim_at_front(x, bdim, size):
   else:
     return moveaxis(x, bdim, 0)
 
-# sets up primitive batchers for ad_util and xla primitives
 
 def add_batched(batched_args, batch_dims):
   bdx, bdy = batch_dims
@@ -1141,9 +1143,3 @@ def add_batched(batched_args, batch_dims):
     x = moveaxis(x, bdx, bdy)
     return add_jaxvals(x, y), bdy
 primitive_batchers[add_jaxvals_p] = add_batched
-
-def zeros_like_batched(batched_args, batch_dims):
-  val, = batched_args
-  bdim, = batch_dims
-  return zeros_like_jaxval(val), bdim
-primitive_batchers[zeros_like_p] = zeros_like_batched

@@ -31,6 +31,8 @@ jax2tf.convert docstring, and the
 [README](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md).
 """
 
+from __future__ import annotations
+
 import collections
 from collections.abc import Iterable, Sequence
 import dataclasses
@@ -42,7 +44,8 @@ import math
 import operator as op
 import threading
 import tokenize
-from typing import Any, Optional, Union
+from typing import Any, Callable, Union
+import warnings
 
 import numpy as np
 import opt_einsum
@@ -59,9 +62,9 @@ from jax._src.interpreters import mlir
 from jax._src.numpy import lax_numpy
 from jax._src import tree_util
 from jax._src import util
-from jax._src.typing import DimSize, Shape
 
 
+DimSize = Union["_DimExpr", int]
 TfVal = Any
 DimVarEnv = dict[str, jax.Array]
 DType = Any
@@ -107,13 +110,22 @@ class _DimAtom:
     * operands: the operands to which the operation is applied.
   """
   # The supported operations
+  # FLOORDIV(e1, e2) and MOD(e1, e2) have the same semantics as in Python:
+  # FLOORDIV(e1, e2) = e1 // e2 = floor(e1 / e2)
+  # if e2 > 0 then 0 <= MOD(e1, e2) < e2
+  # if e2 < 0 then e2 < MOD(e1, e2) <= 0
+  # e1 = e2 * FLOORDIV(e1, e2) + MOD(e1, e2)
+  #
   FLOORDIV = "floordiv"
   MOD = "mod"
-  NON_NEGATIVE = "non_negative"  # The max of the operand and 0
+  MAX = "max"
+  MIN = "min"
+  NON_NEGATIVE = "non_negative"  # The max of the operand and 0. Replaced with
+                                 # max but kept here for backwards compatibility.
 
-  def __init__(self, *operands: '_DimExpr',
-               var: Optional[str] = None,
-               operation: Optional[str] = None):
+  def __init__(self, *operands: _DimExpr,
+               var: str | None = None,
+               operation: str | None = None):
     if var is not None:
       assert operation is None
       assert not operands
@@ -122,12 +134,24 @@ class _DimAtom:
     self.var = var
     self.operation = operation
     self.operands = operands
+    # Precompute the hash (used extensively because these are kept in
+    # dictionaries) and the size (used for sorting, which is important for
+    # some of the reasoning). It is important for the size of _DimAtom,
+    # _DimMon, or _DimExpr, to be strictly larger than the size of any
+    # constituent sub-item.
+    self._hash = hash((self.var, self.operation, *self.operands))
+    self._size = 1 if var is not None else 1 + sum(o._size for o in operands)
 
   @classmethod
-  def from_var(cls, v: str) -> '_DimAtom':
+  def from_var(cls, v: str) -> _DimAtom:
     return _DimAtom(var=v)
 
-  def to_var(self) -> Optional[str]:
+  @classmethod
+  def from_operation(cls, operation: str, *operands: DimSize) -> _DimAtom:
+    return _DimAtom(*(_ensure_poly(o, operation) for o in operands),
+                    operation=operation)
+
+  def to_var(self) -> str | None:
     return self.var
 
   def get_vars(self) -> set[str]:
@@ -140,10 +164,6 @@ class _DimAtom:
         acc.update(opnd.get_vars())
       return acc
 
-  @classmethod
-  def from_operation(cls, operation: str, *operands: '_DimExpr') -> '_DimAtom':
-    return _DimAtom(*operands, operation=operation)
-
   def __str__(self):
     if self.var is not None:
       return self.var
@@ -152,40 +172,40 @@ class _DimAtom:
   __repr__ = __str__
 
   def __hash__(self):
-    return hash((self.var, self.operation, *self.operands))
+    return self._hash
+
+  def _syntactic_cmp(self, other: _DimAtom) -> int:
+    """Returns -1 if self < other, 0 if self == other, 1 if self > other.
+    The comparison is done lexicographically (syntactic), to be used for sorting.
+    The result is not related to the semantic value.
+    """
+    if c := cmp_comparable(self._size, other._size): return c
+    if self.var is not None:
+      return cmp_comparable(self.var, other.var)
+    if c := cmp_comparable(self.operation, other.operation): return c  # type: ignore
+    return cmp_sequence(self.operands, other.operands,
+                        lambda s_o, o_o: s_o._syntactic_cmp(o_o))
 
   def __eq__(self, other: Any):
-    # Used only for hashing
+    """Lexicographic comparison."""
     if not isinstance(other, _DimAtom): return False
-    if (self.var is None) != (other.var is None): return False
-    if self.var is not None:
-      return self.var == other.var
-    else:
-      def symbolic_equal(e1: '_DimExpr', e2: '_DimExpr') -> bool:
-        try:
-          return e1 == e2
-        except InconclusiveDimensionOperation:
-          return False
-      return (self.operation == other.operation and
-              all(symbolic_equal(self_o, other_o)
-                  for self_o, other_o in zip(self.operands, other.operands)))
+    return self._syntactic_cmp(other) == 0
 
-  def __lt__(self, other: '_DimAtom'):
-    """
-    Comparison to another atom in graded reverse lexicographic order.
-    Used only for determining a sorting order, does not relate to the
-    comparison of the values of the atom.
-    """
-    if self.var is not None and other.var is not None:
-      return self.var < other.var
-    elif self.var is not None:
-      return True
-    elif other.var is not None:
-      return True
-    elif self.operation != other.operation:
-      return self.operation < other.operation  # type: ignore
-    else:
-      return id(self) < id(other)
+  def __lt__(self, other: _DimAtom):
+    """Lexicographic comparison."""
+    return self._syntactic_cmp(other) < 0
+
+  def __le__(self, other: _DimAtom):
+    """Lexicographic comparison."""
+    return self._syntactic_cmp(other) <= 0
+
+  def __gt__(self, other: _DimAtom):
+    """Lexicographic comparison."""
+    return self._syntactic_cmp(other) > 0
+
+  def __ge__(self, other: _DimAtom):
+    """Lexicographic comparison"""
+    return self._syntactic_cmp(other) >= 0
 
   def bounds(self) -> tuple[float, float]:
     """Returns the lower and upper bounds, or -+ inf."""
@@ -218,9 +238,13 @@ class _DimAtom:
       else:
         return (-np.inf, np.inf)
 
-    elif self.operation == _DimAtom.NON_NEGATIVE:
-      (b_l, b_h), = opnd_bounds
-      return (max(0, b_l), max(0, b_h))
+    elif self.operation == _DimAtom.MAX:
+      (a_l, a_h), (b_l, b_h) = opnd_bounds
+      return (max(a_l, b_l), max(a_h, b_h))
+
+    elif self.operation == _DimAtom.MIN:
+      (a_l, a_h), (b_l, b_h) = opnd_bounds
+      return (min(a_l, b_l), min(a_h, b_h))
 
     else:
       assert False
@@ -240,15 +264,24 @@ class _DimAtom:
         return divmod(*operand_values)[0]  # type: ignore
       elif self.operation == _DimAtom.MOD:
         return divmod(*operand_values)[1]  # type: ignore
-      elif self.operation == _DimAtom.NON_NEGATIVE:
-        operand = operand_values[0]
-        if core.is_constant_dim(operand):
-          return max(operand, 0)
-        if core.is_symbolic_dim(operand):
-          return core.non_negative_dim(operand)
+      elif self.operation == _DimAtom.MAX:
+        op1, op2 = operand_values
+        if core.is_constant_dim(op1) and core.is_constant_dim(op2):
+          return max(op1, op2)
+        if core.is_symbolic_dim(op1) or core.is_symbolic_dim(op2):
+          return core.max_dim(op1, op2)
         # In the context of `evaluate` dimension variables may be mapped to
         # JAX Tracers.
-        return lax.max(operand, 0)
+        return lax.max(op1, op2)
+      elif self.operation == _DimAtom.MIN:
+        op1, op2 = operand_values
+        if core.is_constant_dim(op1) and core.is_constant_dim(op2):
+          return min(op1, op2)
+        if core.is_symbolic_dim(op1) or core.is_symbolic_dim(op2):
+          return core.min_dim(op1, op2)
+        # In the context of `evaluate` dimension variables may be mapped to
+        # JAX Tracers.
+        return lax.min(op1, op2)
       else:
         assert False, self.operation
 
@@ -258,31 +291,47 @@ class _DimMon(dict):
   The representation is a dictionary mapping _DimAtom to exponent.
   The exponents are integers >= 1.
   """
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._hash = hash(frozenset(self.items()))
+    self._size = sum((1 + a._size) for a, a_exp in self.items())
+
   def __hash__(self):
-    return hash(frozenset(self.items()))
+    return self._hash
 
   def __str__(self):
     return "*".join(f"{key}^{exponent}" if exponent != 1 else str(key)
                     for key, exponent in sorted(self.items()))
 
   @classmethod
-  def from_var(cls, v: str) -> '_DimMon':
+  def from_var(cls, v: str) -> _DimMon:
     return _DimMon({_DimAtom.from_var(v): 1})
 
   @classmethod
   def from_atom(clscls, a: _DimAtom, aexp: int):
     return _DimMon({a: aexp})
 
-  def to_var(self) -> Optional[str]:
-    """Extract the variable name "x", from a monomial "x".
-     Return None, if the monomial is not a single variable."""
+  @classmethod
+  def from_operation(cls, operation: str, *operands: DimSize) -> _DimMon:
+    return _DimMon({_DimAtom.from_operation(operation, *operands): 1})
+
+  def to_var(self) -> str | None:
+    """Extract the variable name from a monomial.
+     Return None if the monomial is not a single variable."""
+    a = self.to_atom()
+    return a.to_var() if a is not None else None
+
+  def to_atom(self) -> _DimAtom | None:
+    """Extract the single atom from a monomial.
+     Return None if the monomial is not a single atom."""
     items = self.items()
     if len(items) != 1:
       return None
     (a, aexp), = items
     if aexp != 1:
       return None
-    return a.to_var()
+    return a
 
   def get_vars(self) -> set[str]:
     # All the vars that appear in the monomial
@@ -291,31 +340,48 @@ class _DimMon(dict):
       acc.update(a.get_vars())
     return acc
 
-  @classmethod
-  def from_operation(cls, operation: str, *operands: '_DimExpr') -> '_DimMon':
-    return _DimMon({_DimAtom.from_operation(operation, *operands): 1})
-
   @property
   def degree(self):
     return sum(self.values())
 
-  def __lt__(self, other: '_DimMon'):
+  def _syntactic_cmp(self, other: _DimMon) -> int:
+    """Returns -1 if self < other, 0 if self == other, 1 if self > other.
+    The comparison is done lexicographically (syntactic), to be used for sorting.
+    The result is not related to the semantic value.
     """
-    Comparison to another monomial in graded reverse lexicographic order.
-    Used only for determining a sorting order, does not relate to the
-    comparison of the values of the monomial.
-    """
-    self_key = -self.degree, tuple(sorted(self))
-    other_key = -other.degree, tuple(sorted(other))
-    return self_key > other_key
+    if c := cmp_comparable(self._size, other._size): return c
+    if c := cmp_comparable(self.degree, other.degree): return c
+    def cmp_atom(s_a: tuple[_DimAtom, int], o_a: tuple[_DimAtom, int]) -> int:
+      if c := s_a[0]._syntactic_cmp(o_a[0]): return c
+      # Consider the monomials with exponents to be expanded as multiplications.
+      # Then a higher exponent for a "small" atom should lead to a "smaller" monomial.
+      return - cmp_comparable(s_a[1], o_a[1])
 
-  def mul(self, other: '_DimMon') -> '_DimMon':
+    return cmp_sequence(sorted(self.items()), sorted(other.items()), cmp_atom)
+
+  def __lt__(self, other: _DimMon):
+    """Lexicographic comparison"""
+    return self._syntactic_cmp(other) < 0
+
+  def __le__(self, other: _DimMon):
+    """Lexicographic comparison"""
+    return self._syntactic_cmp(other) <= 0
+
+  def __gt__(self, other: _DimMon):
+    """Lexicographic comparison"""
+    return self._syntactic_cmp(other) > 0
+
+  def __ge__(self, other: _DimMon):
+    """Lexicographic comparison"""
+    return self._syntactic_cmp(other) >= 0
+
+  def mul(self, other: _DimMon) -> _DimMon:
     """
     Returns the product with another monomial. Example: (n^2*m) * n == n^3 * m.
     """
     return _DimMon(collections.Counter(self) + collections.Counter(other))
 
-  def divide(self, divisor: '_DimMon') -> '_DimMon':
+  def divide(self, divisor: _DimMon) -> _DimMon:
     """
     Divides by another monomial. Raises a InconclusiveDimensionOperation
     if the result is not a monomial.
@@ -342,7 +408,6 @@ class _DimMon(dict):
     candidates = [math.prod(atom_bounds) for atom_bounds in itertools.product(*bounds)]
     return (min(*candidates), max(*candidates))  # type: ignore
 
-
   def evaluate(self, env: DimVarEnv):
     prod = lambda xs: functools.reduce(_evaluate_multiply, xs) if xs else core.dim_constant(1)
     def pow_opt(v, p: int):
@@ -364,16 +429,27 @@ class _DimExpr():
   integer coefficients. The special monomial `_DimMon()` is mapped to the
   free integer coefficient of the expression.
   """
-
   __array_priority__ = 1000   # Same as tracer, for __radd__ and others on ndarray
   def __init__(self, coeffs: dict[_DimMon, int]):
     # Do not construct _DimExpr directly, unless you are sure that coeffs is
     # normalized; Use _DimExpr.normalize.
     # Takes ownership of coeffs
     self._coeffs = coeffs or {_DimMon(): 0}
+    self._monomials_sorted = tuple(sorted(self._coeffs.items(), reverse=True))
+    self._hash = hash(self._monomials_sorted)
+    self._size = sum((1 + m._size)
+                     for m, m_count in self._monomials_sorted)
 
   def monomials(self) -> Iterable[tuple[_DimMon, int]]:
-    return self._coeffs.items()
+    """The monomials in sorted reverse lexicographic order.
+    Higher-degree monomials come earlier in the order.
+    """
+    return self._monomials_sorted
+
+  @property
+  def leading_term(self) -> tuple[_DimMon, int]:
+    """Returns the highest degree term that comes first lexicographically."""
+    return self._monomials_sorted[0]
 
   @classmethod
   def _add_coeffs(cls, coeffs: dict[_DimMon, int], mon: _DimMon, coeff: int):
@@ -428,26 +504,44 @@ class _DimExpr():
     return _DimExpr.normalize(coeffs)
 
   @classmethod
-  def from_monomial(cls, mon: _DimMon, exp: int):
-    return _DimExpr.normalize({mon: exp})
+  def from_monomial(cls, mon: _DimMon, count: int):
+    return _DimExpr.normalize({mon: count})
 
   @classmethod
-  def from_var(cls, v: str) -> '_DimExpr':
+  def from_var(cls, v: str) -> _DimExpr:
     return _DimExpr({_DimMon.from_var(v): 1})
 
   @classmethod
-  def from_operation(cls, operation: str, *operands: '_DimExpr') -> '_DimExpr':
-    return _DimExpr.from_monomial(_DimMon.from_operation(operation, *operands), 1)
+  def from_operation(cls, operation: str, *operands: DimSize) -> _DimExpr:
+    if operation == _DimAtom.NON_NEGATIVE:  # For parsing
+      return _DimExpr.from_monomial(_DimMon.from_operation(_DimAtom.MAX,
+                                                           *operands,
+                                                           0), 1)
+    return _DimExpr.from_monomial(_DimMon.from_operation(operation,
+                                                         *operands), 1)
 
-  def to_var(self) -> Optional[str]:
-    """Extract the variable name "x", from a symbolic expression."""
+  def to_monomial(self) -> _DimMon | None:
+    """Extract the single monomial from a symbolic expression.
+    Returns None if the expression is not a single monomial."""
     items = self.monomials()
     if len(items) != 1:  # type: ignore
       return None
     (mon, mon_count), = items
     if mon_count != 1:
       return None
-    return mon.to_var()
+    return mon
+
+  def to_atom(self) -> _DimAtom | None:
+    """Extract the atom from a symbolic expression.
+    Returns None if the expression is not a single atom."""
+    mon = self.to_monomial()
+    return mon.to_atom() if mon is not None else None
+
+  def to_var(self) -> str | None:
+    """Extract the variable name from a symbolic expression.
+    Returns None if the expression is not a single variable."""
+    mon = self.to_atom()
+    return mon.to_var() if mon is not None else None
 
   def get_vars(self) -> set[str]:
     """The variables that appear in a symbolic dimension."""
@@ -456,62 +550,108 @@ class _DimExpr():
       acc.update(mon.get_vars())
     return acc
 
-  def eq(self, other: DimSize) -> bool:
-    lb, ub = _ensure_poly(self - other, "eq").bounds()
-    if lb == ub == 0:
-      return True
-    if lb > 0 or ub < 0:
+  def _syntactic_cmp(self, other: _DimExpr) -> int:
+    """Returns -1 if self < other, 0 if self == other, 1 if self > other.
+    The comparison is done lexicographically (syntactic), to be used for sorting.
+    The result is not related to the semantic value.
+    """
+    s_mons = self._monomials_sorted
+    o_mons = other._monomials_sorted
+    def cmp_mon(s_mon: tuple[_DimMon, int], o_mon: tuple[_DimMon, int]) -> int:
+      if c := s_mon[0]._syntactic_cmp(o_mon[0]): return c
+      return cmp_comparable(s_mon[1], o_mon[1])
+    return cmp_sequence(s_mons, o_mons, cmp_mon)
+
+  def eq(self, other: _DimExpr) -> bool:
+    # Equality is used very frequently because expressions are cached. We could
+    # implement a more precise version based on `(self - other).bounds() = (0, 0)`
+    # but that would be too expensive. It would also have the unfortunate drawback
+    # that we cannot then cache `e.bounds()` because hashing invokes equality
+    # which would lead to infinite recursion.
+    diff = self - other
+
+    # We look for `self - other == k`, and we rely on the fact that when we
+    # normalize _DimExpr that represent integers as ints.
+    if is_symbolic_dim(diff):
+      # Here we really ought to raise InconclusiveDimensionOperation, but __eq__
+      # cannot raise exceptions, because it is used indirectly when hashing.
+      # So, we say that the expressions are disequal, which is really unsound.
+      # See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#comparison-of-symbolic-dimensions-is-partially-supported
       return False
-    # See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#comparison-of-symbolic-dimensions-is-partially-supported
-    return False
 
-  def inconclusive_comparison(self, operation: str, op: Any) -> Exception:
-    return InconclusiveDimensionOperation(
-      f"Symbolic dimension comparison '{self}' {operation} '{op}' is inconclusive.\n"
-      "See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#comparison-of-symbolic-dimensions-is-partially-supported.")
+    return diff == 0
 
-  def ge(self, other: DimSize) -> bool:
+  def ge(self, other: DimSize,
+         cmp_str: Callable[[], str] | None = None) -> bool:
+    """Implements `self >= other`.
+
+    Raises InconclusiveDimensionOperation if the result is not conclusive.
+    Uses `cmp_str()` as a description of the comparison in the exception
+    string.
+    """
     self_minus_other = _ensure_poly(self - other, "ge")
     lb, ub = self_minus_other.bounds()
     if lb >= 0:
       return True
     if ub < 0:
       return False
-    # Attempt to handle non_negative. For the decomposition:
-    #    e = factor * non_negative(operand)^exp * rest_monomial + rest_expr
-    # use the rule:
-    #    e >= 0 IF factor * operand^exp * rest_monomial + rest_expr >= 0 AND
-    #              (rest_expr >= 0 OR
-    #               exp is odd AND factor * rest_monomial >= 0  OR
-    #               exp is even AND factor * rest_monomial <= 0)
-    for dec in _decompose_expr(self_minus_other, _DimAtom.NON_NEGATIVE):
-      # e = factor * non_negative(operands)^exp * rest_monomial + rest_expr
-      e2 = dec.rest_expr + dec.factor * (
-          dec.operands[0] ** dec.exp) * dec.rest_monomial
-      if not definitely_geq_0(e2):
-        continue
-      if definitely_geq_0(dec.rest_expr):
-        return True
-      if dec.exp % 2 == 1:
-        if definitely_geq_0(dec.factor * dec.rest_monomial):
+    # Attempt to handle max. For the decomposition
+    #    e = factor * max(op1, op2) + rest_expr
+    # use the rule
+    #    e >= 0 IF (factor > 0 AND
+    #                (factor * op1 + rest_expr >= 0 OR
+    #                 factor * op2 + rest_expr >= 0))
+    #              OR
+    #              (factor < 0 AND
+    #                (factor * op1 + rest_expr >= 0 AND
+    #                 factor * op2 + rest_expr >= 0))
+    for dec in _decompose_expr(self_minus_other, _DimAtom.MAX,
+                               with_exp=1, with_rest_monomial=1):
+      op1, op2 = dec.operands
+      if dec.factor > 0:
+        if (definitely_geq_0(dec.factor * op1 + dec.rest_expr) or
+            definitely_geq_0(dec.factor * op2 + dec.rest_expr)):
           return True
       else:
-        if definitely_geq_0(- dec.factor * dec.rest_monomial):
+        if (definitely_geq_0(dec.factor * op1 + dec.rest_expr) and
+            definitely_geq_0(dec.factor * op2 + dec.rest_expr)):
+          return True
+
+    # Attempt to handle min. For the decomposition
+    #    e = factor * min(op1, op2) + rest_expr
+    # use the same rule as for
+    #    e = max(factor * op1, factor * op2) + rest_expr
+    for dec in _decompose_expr(self_minus_other, _DimAtom.MIN,
+                               with_exp=1, with_rest_monomial=1):
+      op1, op2 = dec.operands
+      if dec.factor > 0:
+        if (definitely_geq_0(dec.factor * op1 + dec.rest_expr) and
+            definitely_geq_0(dec.factor * op2 + dec.rest_expr)):
+          return True
+      else:
+        if (definitely_geq_0(dec.factor * op1 + dec.rest_expr) or
+            definitely_geq_0(dec.factor * op2 + dec.rest_expr)):
           return True
 
     # Attempt to handle floordiv >= 0
     for dec in _decompose_expr(self_minus_other, _DimAtom.FLOORDIV,
                                with_exp=1, with_rest_monomial=1,
                                with_rest_expr=0):
-      # e = factor * floordiv(op1, op2)^1 * 1 + 0
+      # e = factor * floordiv(op0, op1)^1 * 1 + 0
       if dec.factor > 0:
         if definitely_geq_0(dec.operands[0]) and definitely_geq_0(dec.operands[1]):
           return True
 
-    raise self.inconclusive_comparison(">=", other)
+    if cmp_str is not None:
+      msg = cmp_str()
+    else:
+      msg = f"'{self}' >= '{other}'"
+    raise InconclusiveDimensionOperation(
+      f"Symbolic dimension comparison {msg} is inconclusive.\n"
+      "See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#comparison-of-symbolic-dimensions-is-partially-supported.")
 
   def __hash__(self):
-    return hash(tuple(sorted(self.monomials())))
+    return self._hash
 
   def __str__(self):
     def _one_monomial(mon, c):
@@ -520,8 +660,11 @@ class _DimExpr():
       if c == 1:
         return str(mon)
       return f"{c}*{mon}"
-    return " + ".join(_one_monomial(mon, c)
-                      for mon, c in sorted(self.monomials(), reverse=True))
+    # We print first the "larger" monomials, so that the constant is last.
+    res = " + ".join(_one_monomial(mon, c)
+                     for mon, c in self._monomials_sorted)
+    res = res.replace(" + -", " - ").replace(" - 1*", " - ")
+    return res
 
   def __repr__(self):
     return str(self)
@@ -552,7 +695,7 @@ class _DimExpr():
       return self.__jax_array__().__rsub__(other)
     return _ensure_poly(other, "sub").__sub__(self)
 
-  def __neg__(self) -> '_DimExpr':
+  def __neg__(self) -> _DimExpr:
     return _DimExpr({mon: -coeff for mon, coeff in self.monomials()})
 
   def __mul__(self, other):
@@ -624,31 +767,33 @@ class _DimExpr():
       raise InconclusiveDimensionOperation(f"Symbolic dimension '{self}' used in a context that requires a constant")
 
   # We must overload __eq__ and __ne__, or else we get unsound defaults.
-  __eq__ = eq
-  def __ne__(self, other: DimSize) -> bool:
-    return not self.eq(other)
+  def __eq__(self, other: Any) -> bool:
+    if not isinstance(other, _DimExpr) and not core.is_constant_dim(other):
+      return False
+    else:
+      other = _ensure_poly(other, "eq")
+    return self.eq(other)
 
-  __ge__ = ge
+  def __ne__(self, other: Any) -> bool:
+    return not self.__eq__(other)
+
+  def __ge__(self, other: DimSize) -> bool:
+    return self.ge(
+      other, lambda: f"'{self}' >= '{other}'")
 
   def __le__(self, other: DimSize):
-    try:
-      return _ensure_poly(other, "le").__ge__(self)
-    except InconclusiveDimensionOperation as e:
-      raise self.inconclusive_comparison("<=", other) from e
+    return _ensure_poly(other, "le").ge(
+      self, lambda: f"'{self}' <= '{other}'")
 
   def __gt__(self, other: DimSize):
-    try:
-      return not _ensure_poly(other, "gt").__ge__(self)
-    except InconclusiveDimensionOperation as e:
-      raise self.inconclusive_comparison(">", other) from e
+    return not _ensure_poly(other, "le").ge(
+      self, lambda: f"'{self}' > '{other}'")
 
   def __lt__(self, other: DimSize):
-    try:
-      return not self.__ge__(other)
-    except InconclusiveDimensionOperation as e:
-      raise self.inconclusive_comparison("<", other) from e
+    return not self.ge(
+      other, lambda: f"'{self}' < '{other}'")
 
-  def divmod(self, divisor: "_DimExpr") -> tuple[DimSize, int]:
+  def divmod(self, divisor: _DimExpr) -> tuple[DimSize, int]:
     """
     Floor division with remainder (divmod) generalized to polynomials.
     If the `divisor` is not a constant, the remainder must be 0.
@@ -664,7 +809,7 @@ class _DimExpr():
       # invariant: self = dividend + divisor * quotient
       # quotient and dividend are changed in the loop; the leading term of
       # dividend decreases at each iteration.
-      while is_poly_dim(dividend) and not dividend.is_constant:
+      while is_symbolic_dim(dividend) and not dividend.is_constant:
         mon, count = dividend.leading_term
         try:
           qmon = mon.divide(dmon)
@@ -731,22 +876,26 @@ class _DimExpr():
   def is_constant(self):
     return len(self._coeffs) == 1 and next(iter(self._coeffs)).degree == 0
 
-  @property
-  def leading_term(self) -> tuple[_DimMon, int]:
-    """Returns the highest degree term that comes first lexicographically."""
-    return max(self.monomials())
-
   def evaluate(self, env: DimVarEnv):
     # Evaluates as a value of dtype=core.dim_value_dtype()
     terms = [_evaluate_multiply(mon.evaluate(env), core.dim_constant(coeff))
              for mon, coeff in self.monomials()]
     return functools.reduce(_evaluate_add, terms) if len(terms) > 1 else terms[0]
 
-  def non_negative(self) -> "_DimExpr":
-    return _DimExpr.from_operation(_DimAtom.NON_NEGATIVE, self)
+  def max(self, other: DimSize) -> _DimExpr:
+    return _DimExpr.from_operation(_DimAtom.MAX, self, other)
+
+  def rmax(self, other: DimSize) -> _DimExpr:
+    return _DimExpr.from_operation(_DimAtom.MAX, other, self)
+
+  def min(self, other: DimSize) -> _DimExpr:
+    return _DimExpr.from_operation(_DimAtom.MIN, self, other)
+
+  def rmin(self, other: DimSize) -> _DimExpr:
+    return _DimExpr.from_operation(_DimAtom.MIN, other, self)
 
   @staticmethod
-  def get_aval(dim: "_DimExpr"):
+  def get_aval(dim: _DimExpr):
     return core.dim_value_aval()
 
   def dimension_as_value(self):
@@ -756,6 +905,21 @@ class _DimExpr():
   def __jax_array__(self):
     # Used for implicit coercions of polynomials as JAX arrays
     return _dim_as_value(self)
+
+def cmp_comparable(i1, i2) -> int:
+  if i1 < i2: return -1
+  if i1 > i2: return 1
+  return 0
+
+def cmp_sequence(s1, s2, elem_cmp) -> int:
+  """Compares two sequences using `elem_cmp`."""
+  l2 = len(s2)
+  for i, e1 in enumerate(s1):
+    if i >= l2: return 1
+    if c := elem_cmp(e1, s2[i]): return c
+  if len(s1) < l2: return -1
+  return 0
+
 
 @dataclasses.dataclass
 class _Decomposition:
@@ -773,10 +937,10 @@ class _Decomposition:
 
 
 def _decompose_expr(e: _DimExpr, operation: str, *,
-                    with_factor: Optional[int] = None,
-                    with_exp: Optional[int] = None,
-                    with_rest_monomial: Optional[Union[_DimExpr, int]] = None,
-                    with_rest_expr: Optional[Union[_DimExpr, int]] = None,
+                    with_factor: int | None = None,
+                    with_exp: int | None = None,
+                    with_rest_monomial: _DimExpr | int | None = None,
+                    with_rest_expr: _DimExpr | int | None = None,
                     ) -> Iterable[_Decomposition]:
   """Computes the decompositions of `e` into `_Decomposition`.
 
@@ -817,7 +981,7 @@ dtypes._weak_types.append(_DimExpr)
 
 def _convertible_to_int(p: DimSize) -> bool:
   try:
-    op.index(p)
+    op.index(p)  # type: ignore
     return True
   except:
     return False
@@ -832,8 +996,14 @@ def _ensure_poly(p: DimSize,
 def _convertible_to_poly(p: DimSize) -> bool:
   return isinstance(p, _DimExpr) or _convertible_to_int(p)
 
-def is_poly_dim(p: DimSize) -> bool:
+def is_symbolic_dim(p: DimSize) -> bool:
   return isinstance(p, _DimExpr)
+
+def is_poly_dim(p: DimSize) -> bool:
+  # TODO: deprecated January 2024, remove June 2024.
+  warnings.warn("is_poly_dim is deprecated, use export.is_symbolic_dim",
+                DeprecationWarning, stacklevel=2)
+  return is_symbolic_dim(p)
 
 dtypes.python_scalar_dtypes[_DimExpr] = dtypes.python_scalar_dtypes[int]
 
@@ -994,9 +1164,9 @@ class PolyShape(tuple):
     return "(" + ", ".join(["..." if d is ... else str(d) for d in self]) + ")"
 
 
-def symbolic_shape(shape_spec: Union[str, PolyShape, None],
+def symbolic_shape(shape_spec: str | PolyShape | None,
                    *,
-                   like: Optional[Sequence[Optional[int]]] = None
+                   like: Sequence[int | None] | None = None
                    ) -> Sequence[DimSize]:
   """Parses the shape polymorphic specification into a symbolic shape.
 
@@ -1028,7 +1198,7 @@ def symbolic_shape(shape_spec: Union[str, PolyShape, None],
 class _Parser:
   def __init__(self,
                shape_spec: str,
-               like_shape: Optional[Sequence[Optional[int]]],
+               like_shape: Sequence[int | None] | None,
                shape_spec_repr: str):
     self.shape_spec = shape_spec
     self.shape_spec_repr = shape_spec_repr  # For error messages
@@ -1043,7 +1213,7 @@ class _Parser:
     self.expect_token(tok, [tokenize.ENDMARKER])
     return sh
 
-  def add_dim(self, expr: Optional[DimSize], tok: tokenize.TokenInfo):
+  def add_dim(self, expr: DimSize | None, tok: tokenize.TokenInfo):
     if expr is None:
       raise self.parse_err(tok,
                            ("unexpected placeholder for unknown dimension; "
@@ -1051,13 +1221,13 @@ class _Parser:
 
     if core.is_constant_dim(expr) and self.like_shape is not None:
       like_shape_dim = self.like_shape[len(self.dimensions)]
-      if expr != like_shape_dim:
+      if expr != like_shape_dim:  # type: ignore[operator]
         raise self.parse_err(tok,
                              (f"different size {expr} for known dimension; "
                               f"like={self.like_shape}"))
     self.dimensions.append(expr)
 
-  def parse_err(self, tok: Optional[tokenize.TokenInfo], detail: str) -> Exception:
+  def parse_err(self, tok: tokenize.TokenInfo | None, detail: str) -> Exception:
     msg = (
         f"syntax error in symbolic shape {self.shape_spec_repr} "
         f"in dimension {len(self.dimensions)}: {detail}. ")
@@ -1175,12 +1345,10 @@ class _Parser:
 
   def atom(self, tok: tokenize.TokenInfo) -> tuple[DimSize, tokenize.TokenInfo]:
     if tok.exact_type == tokenize.NAME:
-      if tok.string == _DimAtom.MOD:
-        return self.binary_op(_DimAtom.MOD, self.next_tok())
-      if tok.string == _DimAtom.FLOORDIV:
-        return self.binary_op(_DimAtom.FLOORDIV, self.next_tok())
-      if tok.string == _DimAtom.NON_NEGATIVE:
-        return self.unary_op(_DimAtom.NON_NEGATIVE, self.next_tok())
+      if tok.string in (_DimAtom.MOD, _DimAtom.FLOORDIV, _DimAtom.MAX, _DimAtom.MIN):
+        return self.atom_binary_op(tok.string, self.next_tok())
+      if tok.string == _DimAtom.NON_NEGATIVE:  # We still parse this for backwards compatibility
+        return self.atom_unary_op(_DimAtom.NON_NEGATIVE, self.next_tok())
       return _DimExpr.from_var(tok.string), self.next_tok()
     number_sign = 1
     if tok.exact_type == tokenize.MINUS:  # -k are negative constants
@@ -1193,13 +1361,13 @@ class _Parser:
     self.expect_token(tok, [tokenize.NAME, tokenize.MINUS, tokenize.NUMBER])
     assert False
 
-  def unary_op(self, op: str, tok) -> tuple[DimSize, tokenize.TokenInfo]:
+  def atom_unary_op(self, op: str, tok) -> tuple[DimSize, tokenize.TokenInfo]:
     tok = self.consume_token(tok, tokenize.LPAR)
     e1, tok = self.expr(tok)
     tok = self.consume_token(tok, tokenize.RPAR)
     return _DimExpr.from_operation(op, e1), tok  # type: ignore
 
-  def binary_op(self, op: str, tok) -> tuple[DimSize, tokenize.TokenInfo]:
+  def atom_binary_op(self, op: str, tok) -> tuple[DimSize, tokenize.TokenInfo]:
     tok = self.consume_token(tok, tokenize.LPAR)
     e1, tok = self.expr(tok)
     tok = self.consume_token(tok, tokenize.COMMA)
@@ -1260,7 +1428,7 @@ def all_dim_vars(args_avals: Sequence[core.AbstractValue]) -> Sequence[str]:
   dim_vars: set[str] = set()
   for a in args_avals:
     for d in a.shape:
-      if is_poly_dim(d):
+      if is_symbolic_dim(d):
         dim_vars = dim_vars.union(d.get_vars())
   return sorted(dim_vars)
 
@@ -1272,7 +1440,7 @@ class CachingShapeEvaluator:
   @functools.lru_cache(128)
   def evaluate(self, e: DimSize):
     if core.is_constant_dim(e):
-      res = op.index(e)
+      res = op.index(e)  # type: ignore
     else:
       res = e.evaluate(self.env)  # type: ignore
     return res
@@ -1289,7 +1457,7 @@ class ShapeConstraint:
   right: DimSize
   # `error_message_pieces` is a list of strings and DimSize. The error message
   # is formed by evaluating the DimSize and concatenating the sequence.
-  error_message_pieces: Sequence[Union[str, DimSize]]
+  error_message_pieces: Sequence[str | DimSize]
 
   def check_statically(self, eval: CachingShapeEvaluator) -> None:
     """Evaluates a constraint statically."""
@@ -1307,7 +1475,7 @@ class ShapeConstraint:
     if not ok:
       raise self.make_error(eval)
 
-  def compute(self, eval: CachingShapeEvaluator) -> Optional[jax.Array]:
+  def compute(self, eval: CachingShapeEvaluator) -> jax.Array | None:
     """Computes if the constraint is satisfied.
 
     If the constraint can be resolved statically returns None
@@ -1383,7 +1551,7 @@ class ShapeConstraints:
   def add_constraint(self,
                      comp: ShapeConstraint.Comparator,
                      left: DimSize, right: DimSize,
-                     error_message_pieces: Sequence[Union[str, DimSize]]):
+                     error_message_pieces: Sequence[str | DimSize]):
     c = ShapeConstraint(comp, left, right, error_message_pieces)
     self.constraints.append(c)
 
@@ -1445,7 +1613,7 @@ def _cached_pretty_print_dimension_descriptor(
 
 def pretty_print_dimension_descriptor(
     args_kwargs_tree: tree_util.PyTreeDef,
-    flat_arg_idx: int, dim_idx: Optional[int]) -> str:
+    flat_arg_idx: int, dim_idx: int | None) -> str:
   arg_str = _cached_pretty_print_dimension_descriptor(args_kwargs_tree, flat_arg_idx)
   if dim_idx is not None:
     arg_str += f".shape[{dim_idx}]"
@@ -1498,13 +1666,13 @@ def solve_dim_vars(
   # tuples with argument name and its polymorphic shape ('args[0]', '(a, a + b'))
   polymorphic_shape_specs: list[tuple[str, str]] = []
   for arg_idx, aval in enumerate(args_avals):
-    if all(not is_poly_dim(d) for d in aval.shape):
+    if all(not is_symbolic_dim(d) for d in aval.shape):
       continue
     polymorphic_shape_specs.append(
       (pretty_print_dimension_descriptor(args_kwargs_tree, arg_idx, None),
        str(aval.shape)))
     for dim_idx, aval_d in enumerate(aval.shape):
-      if is_poly_dim(aval_d):
+      if is_symbolic_dim(aval_d):
         synth_dim_var = pretty_print_dimension_descriptor(args_kwargs_tree,
                                                           arg_idx, dim_idx)
         synth_dimension_vars.append((synth_dim_var, arg_idx, dim_idx))
@@ -1551,7 +1719,7 @@ def _solve_dim_equations(
   # Returns a shape environment and the shape constraints if it can solve all
   # dimension variables. Raises an exception if it cannot.
   shapeenv: DimVarEnv = {}
-  solution_error_message_pieces: list[Union[str, _DimExpr]] = [
+  solution_error_message_pieces: list[str | _DimExpr] = [
     " Obtained dimension variables: "
   ]  # Error message describing the solution
   # Prepare error message piece describing the polymorphic shape specs

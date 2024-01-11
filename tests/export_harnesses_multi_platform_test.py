@@ -19,9 +19,11 @@ cross-platform lowering mode. The actual mechanism for multi-platform and
 cross-platform lowering is tested in export_test.py.
 """
 
+from __future__ import annotations
+
 import math
 import re
-from typing import Callable, Optional
+from typing import Callable
 
 from absl import logging
 from absl.testing import absltest
@@ -31,7 +33,7 @@ import numpy as np
 import jax
 from jax import lax
 from jax._src import test_util as jtu
-from jax.experimental.export import export
+from jax.experimental import export
 from jax._src.internal_test_util import test_harnesses
 
 
@@ -95,6 +97,9 @@ class PrimitiveTest(jtu.JaxTestCase):
         and _known_failures_gpu.search(harness.fullname)):
       self.skipTest("failure to be investigated")
 
+    if harness.params.get("enable_xla", False):
+      self.skipTest("enable_xla=False is not relevant")
+
     func_jax = harness.dyn_fun
     args = harness.dyn_args_maker(self.rng())
 
@@ -124,7 +129,7 @@ class PrimitiveTest(jtu.JaxTestCase):
       *args: jax.Array,
       unimplemented_platforms: set[str] = set(),
       skip_run_on_platforms: set[str] = set(),
-      tol: Optional[float] = None):
+      tol: float | None = None):
     devices = [
         d
         for d in self.__class__.devices

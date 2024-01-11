@@ -1,4 +1,4 @@
-# Copyright 2023 The JAX Authors.
+# Copyright 2024 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ruff: noqa: F401
+# ruff: noqa
 
-from .mosaic.python import apply_vector_layout # pytype: disable=import-error
-from .mosaic.python import infer_memref_layout # pytype: disable=import-error
-from .mosaic.python import tpu # pytype: disable=import-error
+"""Python bindings for the MLIR Triton dialect."""
+
+from ._triton_enum_gen import *  # pylint: disable=wildcard-import
+from ._triton_ext import register_dialect, PointerType
+from ._triton_ops_gen import *  # pylint: disable=wildcard-import

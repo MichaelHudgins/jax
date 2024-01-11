@@ -76,14 +76,15 @@ def _valid_dtypes_for_shape(shape, dtypes):
 OpRecord = collections.namedtuple(
   "OpRecord",
   ["name", "nargs", "dtypes", "shapes", "rng_factory", "diff_modes",
-   "test_name", "check_dtypes", "tolerance", "inexact", "kwargs"])
+   "test_name", "check_dtypes", "tolerance", "inexact", "kwargs", "alias"])
 
 def op_record(name, nargs, dtypes, shapes, rng_factory, diff_modes,
               test_name=None, check_dtypes=True,
-              tolerance=None, inexact=False, kwargs=None):
+              tolerance=None, inexact=False, kwargs=None,
+              alias=None):
   test_name = test_name or name
   return OpRecord(name, nargs, dtypes, shapes, rng_factory, diff_modes,
-                  test_name, check_dtypes, tolerance, inexact, kwargs)
+                  test_name, check_dtypes, tolerance, inexact, kwargs, alias)
 
 JAX_ONE_TO_ONE_OP_RECORDS = [
     op_record("abs", 1, all_dtypes,
@@ -168,6 +169,20 @@ JAX_ONE_TO_ONE_OP_RECORDS = [
               inexact=True, tolerance={np.complex64: 2E-2, np.complex128: 2E-12}),
     op_record("arctanh", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
               inexact=True, tolerance={np.float64: 1e-9}),
+    op_record("asin", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
+              inexact=True, tolerance={np.complex128: 2e-15}, alias="arcsin"),
+    op_record("acos", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
+              inexact=True, alias="arccos"),
+    op_record("atan", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
+              inexact=True, alias="arctan"),
+    op_record("atan2", 2, float_dtypes, all_shapes, jtu.rand_small, ["rev"],
+              inexact=True, check_dtypes=False, alias="arctan2"),
+    op_record("asinh", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"],
+              inexact=True, tolerance={np.complex64: 2E-4, np.complex128: 2E-14}, alias="arcsinh"),
+    op_record("acosh", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"],
+              inexact=True, tolerance={np.complex64: 2E-2, np.complex128: 2E-12}, alias="arccosh"),
+    op_record("atanh", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
+              inexact=True, tolerance={np.float64: 1e-9}, alias="arctanh"),
 ]
 
 JAX_COMPOUND_OP_RECORDS = [
@@ -240,6 +255,8 @@ JAX_COMPOUND_OP_RECORDS = [
               tolerance={dtypes.bfloat16: 4e-2, np.float16: 2e-2,
                          np.float64: 1e-12}),
     op_record("positive", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"]),
+    op_record("pow", 2, number_dtypes, all_shapes, jtu.rand_positive, ["rev"],
+              tolerance={np.complex128: 1e-14}, check_dtypes=False, alias="power"),
     op_record("power", 2, number_dtypes, all_shapes, jtu.rand_positive, ["rev"],
               tolerance={np.complex128: 1e-14}, check_dtypes=False),
     op_record("rad2deg", 1, float_dtypes, all_shapes, jtu.rand_default, []),
@@ -293,6 +310,8 @@ JAX_COMPOUND_OP_RECORDS = [
 JAX_BITWISE_OP_RECORDS = [
     op_record("bitwise_and", 2, int_dtypes + unsigned_dtypes, all_shapes,
               jtu.rand_fullrange, []),
+    op_record("bitwise_invert", 1, int_dtypes + unsigned_dtypes, all_shapes,
+              jtu.rand_fullrange, [], alias='bitwise_not'),
     op_record("bitwise_not", 1, int_dtypes + unsigned_dtypes, all_shapes,
               jtu.rand_fullrange, []),
     op_record("invert", 1, int_dtypes + unsigned_dtypes, all_shapes,
@@ -418,7 +437,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     jtu.sample_product_testcases(
       [dict(op_name=rec.name, rng_factory=rec.rng_factory,
             check_dtypes=rec.check_dtypes, tolerance=rec.tolerance,
-            inexact=rec.inexact, kwargs=rec.kwargs or {})],
+            inexact=rec.inexact, kwargs=rec.kwargs or {}, alias=rec.alias)],
       [dict(shapes=shapes, dtypes=dtypes)
         for shapes in filter(
           _shapes_are_broadcast_compatible,
@@ -430,8 +449,8 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
                                JAX_COMPOUND_OP_RECORDS)))
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   def testOp(self, op_name, rng_factory, shapes, dtypes, check_dtypes,
-             tolerance, inexact, kwargs):
-    np_op = partial(getattr(np, op_name), **kwargs)
+             tolerance, inexact, kwargs, alias):
+    np_op = partial(getattr(np, op_name) if hasattr(np, op_name) else getattr(np, alias), **kwargs)
     jnp_op = partial(getattr(jnp, op_name), **kwargs)
     np_op = jtu.ignore_warning(category=RuntimeWarning,
                                message="invalid value.*")(np_op)
@@ -443,8 +462,8 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     tol = max(jtu.tolerance(dtype, tolerance) for dtype in dtypes)
     if jtu.test_device_matches(["tpu"]) and op_name in (
         "arccosh", "arcsinh", "sinh", "cosh", "tanh", "sin", "cos", "tan",
-        "log", "log1p", "log2", "log10", "exp", "expm1", "exp2", "power",
-        "logaddexp", "logaddexp2", "i0"):
+        "log", "log1p", "log2", "log10", "exp", "expm1", "exp2", "pow",
+        "power", "logaddexp", "logaddexp2", "i0", "acosh", "asinh"):
       tol = jtu.join_tolerance(tol, 1e-4)
     tol = functools.reduce(jtu.join_tolerance,
                            [tolerance, tol, jtu.default_tolerance()])
@@ -559,7 +578,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
 
   @parameterized.parameters(itertools.chain.from_iterable(
     jtu.sample_product_testcases(
-      [dict(name=rec.name, rng_factory=rec.rng_factory)],
+      [dict(name=rec.name, rng_factory=rec.rng_factory, alias=rec.alias)],
       shapes=filter(
         _shapes_are_broadcast_compatible,
         itertools.combinations_with_replacement(rec.shapes, rec.nargs)),
@@ -569,8 +588,8 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     )
     for rec in JAX_BITWISE_OP_RECORDS))
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
-  def testBitwiseOp(self, name, rng_factory, shapes, dtypes):
-    np_op = getattr(np, name)
+  def testBitwiseOp(self, name, rng_factory, shapes, dtypes, alias):
+    np_op = getattr(np, name) if hasattr(np, name) else getattr(np, alias)
     jnp_op = getattr(jnp, name)
     rng = rng_factory(self.rng())
     args_maker = self._GetArgsMaker(rng, shapes, dtypes)
@@ -602,7 +621,7 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
       for dtypes in itertools.product(
         *(_valid_dtypes_for_shape(s, int_dtypes_no_uint64) for s in shapes))
     ],
-    op=[jnp.left_shift, jnp.right_shift],
+    op=[jnp.left_shift, jnp.bitwise_left_shift, jnp.right_shift, jnp.bitwise_right_shift],
   )
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
   def testShiftOpAgainstNumpy(self, op, dtypes, shapes):

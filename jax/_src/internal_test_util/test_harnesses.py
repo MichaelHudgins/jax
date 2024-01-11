@@ -36,11 +36,13 @@ The limitations are used to filter out from tests the harnesses that are known
 to fail. A Limitation is specific to a harness.
 """
 
+from __future__ import annotations
+
 from collections.abc import Iterable, Sequence
 import operator
 import os
 from functools import partial
-from typing import Any, Callable, Optional, NamedTuple, Union
+from typing import Any, Callable, NamedTuple, Union
 
 from absl import testing
 import numpy as np
@@ -151,7 +153,7 @@ class Harness:
   dtype: DType
   # A set of limitations describing the cases that are not supported or
   # partially implemented in JAX for this harness.
-  jax_unimplemented: Sequence["Limitation"]
+  jax_unimplemented: Sequence[Limitation]
   rng_factory: Callable
   # Carry some arbitrary parameters that the test can access.
   params: dict[str, Any]
@@ -164,7 +166,7 @@ class Harness:
                *,
                dtype,
                rng_factory=jtu.rand_default,
-               jax_unimplemented: Sequence["Limitation"] = (),
+               jax_unimplemented: Sequence[Limitation] = (),
                **params):
     """See class docstring."""
     self.group_name = jtu.sanitize_test_name(group_name)
@@ -224,7 +226,7 @@ class Harness:
              device_under_test: str,
              *,
              include_jax_unimpl: bool = False,
-             one_containing: Optional[str] = None) -> bool:
+             one_containing: str | None = None) -> bool:
     if not include_jax_unimpl:
       if any(
           device_under_test in l.devices
@@ -285,7 +287,7 @@ def define(
     *,
     dtype,
     rng_factory=jtu.rand_default,
-    jax_unimplemented: Sequence["Limitation"] = (),
+    jax_unimplemented: Sequence[Limitation] = (),
     **params):
   """Defines a harness and stores it in `all_harnesses`. See Harness."""
   group_name = str(group_name)
@@ -312,7 +314,7 @@ class Limitation:
       description: str,
       *,
       enabled: bool = True,
-      devices: Union[str, Sequence[str]] = ("cpu", "gpu", "tpu"),
+      devices: str | Sequence[str] = ("cpu", "gpu", "tpu"),
       dtypes: Sequence[DType] = (),
       skip_run: bool = False,
   ):
@@ -354,8 +356,8 @@ class Limitation:
   __repr__ = __str__
 
   def filter(self,
-             device: Optional[str] = None,
-             dtype: Optional[DType] = None) -> bool:
+             device: str | None = None,
+             dtype: DType | None = None) -> bool:
     """Check that a limitation is enabled for the given dtype and device."""
     return (self.enabled and
             (not self.dtypes or dtype is None or dtype in self.dtypes) and
@@ -364,7 +366,7 @@ class Limitation:
 
 def parameterized(harnesses: Iterable[Harness],
                   *,
-                  one_containing: Optional[str] = None,
+                  one_containing: str | None = None,
                   include_jax_unimpl: bool = False):
   """Decorator for tests.
 
@@ -700,7 +702,6 @@ for dtype in jtu.dtypes.all:
     _make_bitcast_convert_type_harness(
         "dtypes_to_new_dtypes", dtype=dtype, new_dtype=new_dtype)
 
-
 def _make_add_any_harness(name, *, shapes=((2,), (2,)), dtype=np.float32):
   define(
       ad_util.add_any_p,
@@ -710,9 +711,9 @@ def _make_add_any_harness(name, *, shapes=((2,), (2,)), dtype=np.float32):
       dtype=dtype,
       shapes=shapes)
 
-
 for dtype in set(jtu.dtypes.all) - set(jtu.dtypes.boolean):
   _make_add_any_harness("dtypes", dtype=dtype)
+
 
 for dtype in jtu.dtypes.all:
   shape: tuple[int, ...] = (20, 20)
@@ -762,15 +763,6 @@ for op_name, op in _LAX_COMPARATORS.items():
     _make_comparator_harness(
         "broadcasting", lhs_shape=lhs_shape, rhs_shape=rhs_shape,
         op=op, op_name=op_name)
-
-for dtype in jtu.dtypes.all:
-  shape = (3, 4, 5)
-  define(
-      "zeros_like",
-      f"shape={jtu.format_shape_dtype_string(shape, dtype)}",
-      ad_util.zeros_like_p.bind, [RandArg(shape, dtype)],
-      shape=shape,
-      dtype=dtype)
 
 for dtype in jtu.dtypes.all_integer + jtu.dtypes.all_unsigned:
   if np.issubdtype(dtype, np.unsignedinteger):

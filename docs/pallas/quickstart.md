@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.15.2
+    jupytext_version: 1.16.0
 kernelspec:
   display_name: Python 3 (ipykernel)
   language: python
@@ -244,9 +244,9 @@ def matmul(x: jax.Array, y: jax.Array, *, activation):
       pl.BlockSpec(lambda i, j: (i, 0), (x.shape[0] // 2, x.shape[1])),
       pl.BlockSpec(lambda i, j: (0, j), (y.shape[0], y.shape[1] // 2))
     ],
-    out_specs=[
-      pl.BlockSpec(lambda i, j: (i, j), (x.shape[0] // 2, y.shape[1] // 2))
-    ],
+    out_specs=pl.BlockSpec(
+      lambda i, j: (i, j), (x.shape[0] // 2, y.shape[1] // 2)
+    ),
   )(x, y)
 k1, k2 = jax.random.split(jax.random.PRNGKey(0))
 x = jax.random.normal(k1, (1024, 1024))

@@ -16,10 +16,12 @@
 Implements ufuncs for jax.numpy.
 """
 
+from __future__ import annotations
+
 from functools import partial
 import operator
 from textwrap import dedent
-from typing import Any, Callable, Union, overload
+from typing import Any, Callable, overload
 
 import numpy as np
 
@@ -61,6 +63,7 @@ def _one_to_one_unop(
     fn = lambda x, /: lax_fn(*promote_args_inexact(numpy_fn.__name__, x))
   else:
     fn = lambda x, /: lax_fn(*promote_args(numpy_fn.__name__, x))
+  fn.__name__ = numpy_fn.__name__
   fn.__qualname__ = f"jax.numpy.{numpy_fn.__name__}"
   fn = jit(fn, inline=True)
   if lax_doc:
@@ -124,9 +127,9 @@ def _logical_op(np_op: Callable[..., Any], bitwise_op: UnOp) -> UnOp: ...
 @overload
 def _logical_op(np_op: Callable[..., Any], bitwise_op: BinOp) -> BinOp: ...
 @overload
-def _logical_op(np_op: Callable[..., Any], bitwise_op: Union[UnOp, BinOp]) -> Union[UnOp, BinOp]: ...
+def _logical_op(np_op: Callable[..., Any], bitwise_op: UnOp | BinOp) -> UnOp | BinOp: ...
 
-def _logical_op(np_op: Callable[..., Any], bitwise_op: Union[UnOp, BinOp]) -> Union[UnOp, BinOp]:
+def _logical_op(np_op: Callable[..., Any], bitwise_op: UnOp | BinOp) -> UnOp | BinOp:
   @_wraps(np_op, update_doc=False, module='numpy')
   @partial(jit, inline=True)
   def op(*args):
@@ -136,8 +139,18 @@ def _logical_op(np_op: Callable[..., Any], bitwise_op: Union[UnOp, BinOp]) -> Un
     return bitwise_op(*promote_args(np_op.__name__, *args))
   return op
 
+@jit
+def _arccosh(x: ArrayLike, /) -> Array:
+  # Note: arccosh is multi-valued for complex input, and lax.acosh uses a different
+  # convention than np.arccosh.
+  out = lax.acosh(*promote_args_inexact("arccosh", x))
+  if dtypes.issubdtype(out.dtype, np.complexfloating):
+    out = _where(real(out) < 0, lax.neg(out), out)
+  return out
 
 fabs = _one_to_one_unop(np.fabs, lax.abs, True)
+bitwise_invert = _one_to_one_unop(getattr(np, 'bitwise_invert', np.invert), lax.bitwise_not)
+bitwise_invert = _one_to_one_unop(getattr(np, 'bitwise_invert', np.invert), lax.bitwise_not)
 bitwise_not = _one_to_one_unop(np.bitwise_not, lax.bitwise_not)
 invert = _one_to_one_unop(np.invert, lax.bitwise_not)
 negative = _one_to_one_unop(np.negative, lax.neg)
@@ -157,6 +170,7 @@ arctan = _one_to_one_unop(np.arctan, lax.atan, True)
 sinh = _one_to_one_unop(np.sinh, lax.sinh, True)
 cosh = _one_to_one_unop(np.cosh, lax.cosh, True)
 arcsinh = _one_to_one_unop(np.arcsinh, lax.asinh, True)
+arccosh = _one_to_one_unop(np.arccosh, _arccosh, True)
 tanh = _one_to_one_unop(np.tanh, lax.tanh, True)
 arctanh = _one_to_one_unop(np.arctanh, lax.atanh, True)
 sqrt = _one_to_one_unop(np.sqrt, lax.sqrt, True)
@@ -164,6 +178,7 @@ cbrt = _one_to_one_unop(np.cbrt, lax.cbrt, True)
 
 add = _maybe_bool_binop(np.add, lax.add, lax.bitwise_or)
 bitwise_and = _one_to_one_binop(np.bitwise_and, lax.bitwise_and)
+bitwise_left_shift = _one_to_one_binop(getattr(np, "bitwise_left_shift", np.left_shift), lax.shift_left, promote_to_numeric=True)
 bitwise_or = _one_to_one_binop(np.bitwise_or, lax.bitwise_or)
 bitwise_xor = _one_to_one_binop(np.bitwise_xor, lax.bitwise_xor)
 left_shift = _one_to_one_binop(np.left_shift, lax.shift_left, promote_to_numeric=True)
@@ -187,19 +202,21 @@ logical_not: UnOp = _logical_op(np.logical_not, lax.bitwise_not)
 logical_or: BinOp = _logical_op(np.logical_or, lax.bitwise_or)
 logical_xor: BinOp = _logical_op(np.logical_xor, lax.bitwise_xor)
 
-@_wraps(np.arccosh, module='numpy')
-@jit
-def arccosh(x: ArrayLike, /) -> Array:
-  # Note: arccosh is multi-valued for complex input, and lax.acosh uses a different
-  # convention than np.arccosh.
-  out = lax.acosh(*promote_args_inexact("arccosh", x))
-  if dtypes.issubdtype(out.dtype, np.complexfloating):
-    out = _where(real(out) < 0, lax.neg(out), out)
-  return out
+# Array API aliases
+# TODO(jakevdp): directly reference np_fun when minimum numpy version is 2.0
+acos = _one_to_one_unop(getattr(np, "acos", np.arccos), lax.acos, True)
+acosh = _one_to_one_unop(getattr(np, "acosh", np.arccosh), _arccosh, True)
+asin = _one_to_one_unop(getattr(np, "asin", np.arcsin), lax.asin, True)
+asinh = _one_to_one_unop(getattr(np, "asinh", np.arcsinh), lax.asinh, True)
+atan = _one_to_one_unop(getattr(np, "atan", np.arctan), lax.atan, True)
+atanh = _one_to_one_unop(getattr(np, "atanh", np.arctanh), lax.atanh, True)
+atan2 = _one_to_one_binop(getattr(np, "atan2", np.arctan2), lax.atan2, True)
+
 
 @_wraps(getattr(np, 'bitwise_count', None), module='numpy')
 @jit
 def bitwise_count(x: ArrayLike, /) -> Array:
+  x, = promote_args_numeric("bitwise_count", x)
   # Following numpy we take the absolute value and return uint8.
   return lax.population_count(abs(x)).astype('uint8')
 
@@ -211,6 +228,13 @@ def right_shift(x1: ArrayLike, x2: ArrayLike, /) -> Array:
     np.issubdtype(x1.dtype, np.unsignedinteger) else lax.shift_right_arithmetic
   return lax_fn(x1, x2)
 
+@_wraps(getattr(np, "bitwise_right_shift", np.right_shift), module='numpy')
+@partial(jit, inline=True)
+def bitwise_right_shift(x1: ArrayLike, x2: ArrayLike, /) -> Array:
+  x1, x2 = promote_args_numeric("bitwise_right_shift", x1, x2)
+  lax_fn = lax.shift_right_logical if \
+    np.issubdtype(x1.dtype, np.unsignedinteger) else lax.shift_right_arithmetic
+  return lax_fn(x1, x2)
 
 @_wraps(np.absolute, module='numpy')
 @partial(jit, inline=True)
@@ -340,6 +364,9 @@ def power(x1: ArrayLike, x2: ArrayLike, /) -> Array:
 
   # Handle cases #2 and #3 under a jit:
   return _power(x1, x2)
+
+# Array API alias
+pow = power
 
 @partial(jit, inline=True)
 def _power(x1: ArrayLike, x2: ArrayLike) -> Array:

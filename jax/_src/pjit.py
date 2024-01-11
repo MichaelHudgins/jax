@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Sequence, Iterable
 import dataclasses
 from functools import partial, lru_cache
-import inspect
 import itertools as it
 import logging
+import operator as op
 import weakref
-from typing import Callable, Union, cast, Optional, NamedTuple, Any
+from typing import Callable, cast, NamedTuple, Any, Union
 import threading
 import warnings
 
@@ -54,6 +56,7 @@ from jax._src.interpreters import pxla
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func as func_dialect
 from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
 from jax._src.sharding_impls import (
     NamedSharding, XLACompatibleSharding, GSPMDSharding,
     XLADeviceAssignment, SingleDeviceSharding, PmapSharding,
@@ -64,8 +67,7 @@ from jax._src.state import discharge as state_discharge
 from jax._src.traceback_util import api_boundary
 from jax._src.tree_util import (
     tree_map, tree_flatten, tree_unflatten, treedef_is_leaf, tree_structure,
-    treedef_tuple, broadcast_prefix, all_leaves,
-    prefix_errors, generate_key_paths)
+    treedef_children, broadcast_prefix, all_leaves, prefix_errors, keystr)
 from jax._src.util import (
     HashableFunction, safe_map, safe_zip, wraps,
     distributed_debug_log, split_list, weakref_lru_cache,
@@ -84,58 +86,26 @@ MeshShardingMinusUnspecified = Union[NamedSharding, AUTO]
 logger = logging.getLogger(__name__)
 
 
-def _try_infer_args(f, tree):
-  dummy_args = tree_unflatten(tree, [False] * tree.num_leaves)
-  try:
-    return inspect.signature(f).bind(*dummy_args)
-  except (TypeError, ValueError):
-    return None
-
-
 def _find_arg_mismatch(arg_list, fails, fun_name):
-  first_err, second_err = fails
   mismatched_args_msg = []
-  for name, inp_da, aval in arg_list:
-    if first_err.m_type == pxla.MismatchType.ARG_SHARDING:
-      if first_err.da == inp_da:
+  def mismatch(err):
+    for name, inp_da, aval in arg_list:
+      if err.m_type == pxla.MismatchType.ARG_SHARDING and err.da == inp_da:
         mismatched_args_msg.append(
             f"argument {name} of {fun_name} with shape {aval.str_short()} and "
-             f"{first_err._dev_ids_plat_str}")
+            f"{err._dev_ids_plat_str}")
         break
-
-  for name, inp_da, aval in arg_list:
-    if second_err.m_type == pxla.MismatchType.ARG_SHARDING:
-      if second_err.da == inp_da:
-        mismatched_args_msg.append(
-            f"argument {name} of {fun_name} with shape {aval.str_short()} and "
-             f"{second_err._dev_ids_plat_str}")
-        break
+  first_err, second_err = fails
+  mismatch(first_err)
+  mismatch(second_err)
   return mismatched_args_msg
-
-# TODO(yashkatariya): Try to use debug_info that is populated in
-# common_infer_params.
-def _get_arg_names(fun, in_tree, args_flat):
-  sig = _try_infer_args(fun, in_tree)
-  args_aug = generate_key_paths(tree_unflatten(in_tree, args_flat))
-
-  arg_names = []
-  for arg_key, val in args_aug:
-    ak, *rem_keys = arg_key
-    if sig is not None:
-      loc = ''.join(str(k) for k in rem_keys)
-      try:
-        arg_name = f'{list(sig.arguments.keys())[ak.idx]}{loc}'
-      except IndexError:
-        arg_name = ''  # E.g. variadic positional argument.
-    else:
-      arg_name = ''
-    arg_names.append(arg_name)
-  return arg_names
 
 
 def _device_assignment_mismatch_error(fun_name, fails, args_flat, api_name,
                                       arg_names):
   arg_list = []
+  if arg_names is None:
+    arg_names = [''] * len(args_flat)
   for a, n in zip(args_flat, arg_names):
     da = a.sharding._device_assignment if hasattr(a, 'sharding') else None
     arg_list.append((n, da, shaped_abstractify(a)))
@@ -143,7 +113,7 @@ def _device_assignment_mismatch_error(fun_name, fails, args_flat, api_name,
   mismatched_args_msg = _find_arg_mismatch(arg_list, fails, fun_name)
 
   if len(mismatched_args_msg) == 2:
-    first, second = mismatched_args_msg  # pylint: disable=unbalanced-tuple-unpacking
+    first, second = mismatched_args_msg  # type: ignore
     extra_msg = f" Got {first} and {second}"
   elif len(mismatched_args_msg) == 1:
     first, second  = fails
@@ -158,7 +128,7 @@ def _device_assignment_mismatch_error(fun_name, fails, args_flat, api_name,
 
 
 def _python_pjit_helper(fun, infer_params_fn, *args, **kwargs):
-  args_flat, _, params, in_tree, out_tree, _, _, _ = infer_params_fn(
+  args_flat, _, params, _, out_tree, _, _, _, arg_names = infer_params_fn(
       *args, **kwargs)
   for arg in args_flat:
     dispatch.check_arg(arg)
@@ -167,7 +137,6 @@ def _python_pjit_helper(fun, infer_params_fn, *args, **kwargs):
   except pxla.DeviceAssignmentMismatchError as e:
     fails, = e.args
     api_name = 'jit' if params['resource_env'] is None else 'pjit'
-    arg_names = _get_arg_names(fun, in_tree, args_flat)
     fun_name = getattr(fun, '__qualname__', getattr(fun, '__name__', str(fun)))
     msg = _device_assignment_mismatch_error(
         fun_name, fails, args_flat, api_name, arg_names)
@@ -212,7 +181,9 @@ def _get_fastpath_data(executable, out_tree, args_flat, out_flat):
                        for i in range(len(args_flat))]
     fastpath_data = pxla.MeshExecutableFastpathData(
         executable.xla_executable, out_tree, executable._in_shardings,
-        executable._out_shardings, out_avals, out_committed, kept_var_bitvec)
+        executable._out_shardings, out_avals, out_committed, kept_var_bitvec,
+        executable.unsafe_call.in_handler.local_devices,
+        executable.unsafe_call.in_handler.input_indices)
   else:
     fastpath_data = None
   return fastpath_data
@@ -258,11 +229,19 @@ def _cpp_pjit(fun: Callable, infer_params_fn, static_argnums, static_argnames,
     fastpath_data = _get_fastpath_data(executable, out_tree, args_flat, out_flat)
     return outs, fastpath_data
 
-  cpp_pjit_f = xc._xla.pjit(
-    getattr(fun, "__name__", "<unnamed function>"),
-    fun, cache_miss, static_argnums, static_argnames,
-    donate_argnums, tree_util.dispatch_registry,
-    _get_cpp_global_cache(pjit_has_explicit_sharding))
+  if xla_extension_version >= 226:
+    cpp_pjit_f = xc._xla.pjit(  # type: ignore
+      getattr(fun, "__name__", "<unnamed function>"),
+      fun, cache_miss, static_argnums, static_argnames,
+      donate_argnums, tree_util.dispatch_registry,
+      pxla.shard_arg if xla_extension_version >= 229 else pxla.temp_shard_arg,  # type: ignore
+      _get_cpp_global_cache(pjit_has_explicit_sharding))  # type: ignore
+  else:
+    cpp_pjit_f = xc._xla.pjit(  # type: ignore
+      getattr(fun, "__name__", "<unnamed function>"),
+      fun, cache_miss, static_argnums, static_argnames,
+      donate_argnums, tree_util.dispatch_registry,
+      _get_cpp_global_cache(pjit_has_explicit_sharding))
 
   cpp_pjitted_f = wraps(fun)(cpp_pjit_f)
   cpp_pjitted_f._fun = fun
@@ -331,7 +310,8 @@ def post_infer_params(fun, infer_params_fn, static_argnums, static_argnames,
     in_layouts = kwargs.pop('_in_layouts', None)
     out_layouts = kwargs.pop('_out_layouts', None)
     (args_flat, flat_global_in_avals, params, in_tree, out_tree,
-     donated_invars, in_layouts_flat, out_layouts_flat) = infer_params_fn(
+     donated_invars, in_layouts_flat, out_layouts_flat,
+     arg_names) = infer_params_fn(
          *args, **kwargs, _in_layouts=in_layouts, _out_layouts=out_layouts)
     resource_env = params['resource_env']
     mesh = None if resource_env is None else resource_env.physical_mesh
@@ -346,20 +326,14 @@ def post_infer_params(fun, infer_params_fn, static_argnums, static_argnames,
     except pxla.DeviceAssignmentMismatchError as e:
       fails, = e.args
       api_name = 'jit' if params['resource_env'] is None else 'pjit'
-      arg_names = _get_arg_names(fun, in_tree, args_flat)
       fun_name = getattr(fun, '__qualname__', getattr(fun, '__name__', str(fun)))
       msg = _device_assignment_mismatch_error(
           fun_name, fails, args_flat, api_name, arg_names)
       raise ValueError(msg) from None
 
-    if kwargs:
-      args_kwargs_in_tree = in_tree
-    else:
-      args_kwargs_in_tree = treedef_tuple([in_tree, tree_flatten({})[1]])
-
     donate_argnums = tuple(i for i, d in enumerate(donated_invars) if d)
     return stages.Lowered.from_flat_info(
-        lowering, args_kwargs_in_tree, flat_global_in_avals, donate_argnums,
+        lowering, in_tree, flat_global_in_avals, donate_argnums,
         out_tree)
 
   wrapped.lower = lower
@@ -384,12 +358,12 @@ class PjitInfo(NamedTuple):
   static_argnames: tuple[str, ...]
   donate_argnums: tuple[int, ...]
   donate_argnames: tuple[str, ...]
-  device: Optional[xc.Device]
-  backend: Optional[str]
+  device: xc.Device | None
+  backend: str | None
   keep_unused: bool
   inline: bool
   resource_env: Any
-  abstracted_axes: Optional[Any]
+  abstracted_axes: Any | None
   in_layouts: Any  # pytree[XlaCompatibleLayout] | None
   out_layouts: Any  # pytree[XlaCompatibleLayout] | None
 
@@ -424,18 +398,9 @@ def common_infer_params(pjit_info_args, *args, **kwargs):
                                        allow_invalid=True)
   del args
 
-  # TODO(yashkatariya): Merge the nokwargs and kwargs path. One blocker is
-  # flatten_axes which if kwargs are present in the treedef (even empty {}),
-  # leads to wrong expansion.
-  if kwargs:
-    f, dyn_kwargs = argnames_partial_except(f, static_argnames, kwargs)
-    explicit_args, in_tree = tree_flatten((dyn_args, dyn_kwargs))
-    flat_fun, out_tree = flatten_fun(f, in_tree)
-  else:
-    explicit_args, in_tree = tree_flatten(dyn_args)
-    flat_fun, out_tree = flatten_fun_nokwargs(f, in_tree)
-    dyn_kwargs = {}
-  del kwargs
+  f, dyn_kwargs = argnames_partial_except(f, static_argnames, kwargs)
+  explicit_args, in_tree = tree_flatten((dyn_args, dyn_kwargs))
+  flat_fun, out_tree = flatten_fun(f, in_tree)
 
   if (donate_argnums or donate_argnames) and not config.debug_nans.value:
     donated_invars = donation_vector(
@@ -486,12 +451,12 @@ def common_infer_params(pjit_info_args, *args, **kwargs):
 
   canonicalized_in_shardings_flat, in_layouts_flat = _process_in_axis_resources(
       hashable_pytree(in_shardings), hashable_pytree(in_layouts), in_avals,
-      in_tree, resource_env, dbg, device_or_backend_set)
+      in_tree, resource_env, dbg, device_or_backend_set, True if kwargs else False)
 
   jaxpr, consts, canonicalized_out_shardings_flat, out_layouts_flat = _pjit_jaxpr(
       flat_fun, hashable_pytree(out_shardings), hashable_pytree(out_layouts),
       in_type, dbg, device_or_backend_set, HashableFunction(out_tree, closure=()),
-      HashableFunction(res_paths, closure=()))
+      HashableFunction(res_paths, closure=()), inline)
 
   assert len(explicit_args) == len(canonicalized_in_shardings_flat) == len(in_layouts_flat)
 
@@ -516,12 +481,13 @@ def common_infer_params(pjit_info_args, *args, **kwargs):
       out_shardings=canonicalized_out_shardings_flat,
       resource_env=resource_env,
       donated_invars=donated_invars,
-      name=getattr(flat_fun, '__name__', '<unnamed function>'),
+      name=getattr(flat_fun, '__name__', '<unknown>'),
       keep_unused=keep_unused,
       inline=inline,
   )
   return (consts + args_flat, in_type, params, in_tree, out_tree(),
-          donated_invars, in_layouts_flat, out_layouts_flat)
+          donated_invars, in_layouts_flat, out_layouts_flat,
+          dbg.arg_names if dbg else None)
 
 def _extract_implicit_args(
   in_type: Sequence[tuple[core.AbstractValue, bool]],
@@ -554,7 +520,7 @@ def _extract_implicit_args(
   return [x for x, (_, e) in zip(args, in_type) if not e]  # type: ignore
 
 def _flat_axes_specs(abstracted_axes, *args, **kwargs
-                     ) -> Optional[list[pe.AbstractedAxesSpec]]:
+                     ) -> list[pe.AbstractedAxesSpec] | None:
   if abstracted_axes is None: return None
   if kwargs: raise NotImplementedError
   def ax_leaf(l):
@@ -569,15 +535,15 @@ def pjit(
     fun: Callable,
     in_shardings=UNSPECIFIED,
     out_shardings=UNSPECIFIED,
-    static_argnums: Union[int, Sequence[int], None] = None,
-    static_argnames: Union[str, Iterable[str], None] = None,
-    donate_argnums: Union[int, Sequence[int], None] = None,
-    donate_argnames: Union[str, Iterable[str], None] = None,
+    static_argnums: int | Sequence[int] | None = None,
+    static_argnames: str | Iterable[str] | None = None,
+    donate_argnums: int | Sequence[int] | None = None,
+    donate_argnames: str | Iterable[str] | None = None,
     keep_unused: bool = False,
-    device: Optional[xc.Device] = None,
-    backend: Optional[str] = None,
+    device: xc.Device | None = None,
+    backend: str | None = None,
     inline: bool = False,
-    abstracted_axes: Optional[Any] = None,
+    abstracted_axes: Any | None = None,
 ) -> stages.Wrapped:
   """Makes ``fun`` compiled and automatically partitioned across multiple devices.
 
@@ -893,7 +859,10 @@ class PytreeLeaf:
 @lru_cache(maxsize=4096)
 def _process_in_axis_resources(in_shardings_thunk, in_layouts_thunk, in_avals,
                                in_tree, resource_env, debug_info,
-                               device_or_backend_set):
+                               device_or_backend_set, kws):
+  if not kws:
+    in_tree, _ = treedef_children(in_tree)
+
   orig_in_shardings = in_shardings_thunk()
   # Only do this if original in_shardings are unspecified. If it is AUTO, go
   # via flatten_axis_resources.
@@ -920,9 +889,139 @@ def _process_in_axis_resources(in_shardings_thunk, in_layouts_thunk, in_avals,
       for i, aval in zip(in_shardings_flat, in_avals))
   return canonicalized_shardings, tuple(in_layouts_flat)
 
+callsites: set[str] = set()
 
-@lu.cache
-def _create_pjit_jaxpr(fun, in_type, debug_info, out_paths):
+def explain_tracing_cache_miss(
+    f: Callable, unseen_f: bool, cache: dict, key: tuple, result: tuple):
+  if config.check_tracer_leaks.value: return
+
+  def unpack(key):
+    transforms, (), _, (in_type, debug_info, _, inline), *_, ctx = key
+    (_, (in_tree,)), (_, ()) = transforms
+    return in_tree, in_type, debug_info, inline.val, ctx
+  in_tree, in_type, debug_info, inline, ctx = unpack(key)
+  if inline: return
+
+  msg: list[str] = []
+  p = msg.append
+  done = lambda: logger.log(logging.WARNING, '\n'.join(msg))
+
+  callsite = source_info_util.summarize(source_info_util.current())
+  p(f"TRACING CACHE MISS at {callsite} because:")
+
+  # have we seen this function before at all?
+  fun_name = getattr(f, '__qualname__', f)
+  if debug_info.func_src_info:
+    _, _, *rest = debug_info.func_src_info.split(' ')
+    src_info = " defined at "  + ' '.join(rest)
+  else:
+    src_info = ''
+  if unseen_f:
+    p(f"  never seen function:\n    {fun_name} id={id(f)}{src_info}")
+    if callsite in callsites:
+      p("  but seen another function defined on the same line; maybe the function is\n"
+        "  being re-defined repeatedly, preventing caching?")
+    callsites.add(callsite)
+    return done()
+  else:
+    p(f"  for {fun_name}{src_info}")
+
+  seen_keys = map(unpack, cache.keys())
+
+  # have we maybe switched some args to be kwargs or visa-versa?
+  args_tree, kwargs_tree = treedef_children(in_tree)
+  args_kwargs_trees = [treedef_children(k) for k, *_ in seen_keys]
+  args_kwargs_match = [t for t in args_kwargs_trees
+                       if t == [args_tree, kwargs_tree]]
+  if not args_kwargs_match:
+    num_args = len(treedef_children(args_tree))
+    _, kwarg_keys = kwargs_tree.node_data()  # type: ignore
+    p(f"  never seen passing {num_args} positional args and {len(kwarg_keys)} "
+      "keyword args with keys:\n"
+      f"    {', '.join(map(repr, kwarg_keys))}")
+    dont_match = [set(t[1].node_data()[1]) for t in args_kwargs_trees  # type: ignore
+                  if t != [args_tree, kwargs_tree]]
+    close_kwargs = min(dont_match, key=set(kwarg_keys).symmetric_difference)
+    if not close_kwargs:
+      p("  closest seen is passing no keyword args")
+    else:
+      p(f"  closest seen passes {len(close_kwargs)} keyword args with keys:\n"
+        f"    {', '.join(map(repr, close_kwargs))}")
+    return done()
+
+  # have we never seen this tracing context before?
+  ctxs_match = [c for *_, c in seen_keys if c == ctx]
+  if not ctxs_match:
+    p("  tracing context doesn't match, e.g. due to config or context manager")
+    dont_match = [c for *_, c in seen_keys if c != ctx]
+    closest_ctx = min(dont_match, key=lambda c: sum(map(op.ne, c, ctx)))
+    idxs = [i for i, (c1, c2) in enumerate(zip(ctx, closest_ctx)) if c1 != c2]
+    p("  closest seen context tuple differs at positions:\n"
+      f"    {', '.join(map(str, idxs))}\n"
+      "  compare to tuple returned by config._trace_context() in jax/_src/config.py.")
+    return done()
+
+  # have we never seen this input pytree before?
+  trees_match = [k for k in seen_keys if k[0] == in_tree]
+  if not trees_match:
+    in_tree_str = f':\n    {in_tree}' if len(str(in_tree)) < 76 else ''
+    p(f"  never seen input pytree{in_tree_str}")
+    dont_match = [t for t, *_ in seen_keys if t != in_tree]
+    closest_tree = min(dont_match, key=lambda t: abs(t.num_leaves - in_tree.num_leaves))
+    # TODO(mattjj): make equality_errors not print type name, avoid metaclass
+    leaf = type('LeafMeta', (type,), dict(__repr__=lambda _: 'leaf'))('Leaf', (), {})()
+    this_dummy = tree_unflatten(in_tree, [leaf] * in_tree.num_leaves)
+    close_dummy = tree_unflatten(closest_tree, [leaf] * closest_tree.num_leaves)  # type: ignore
+    errs = list(tree_util.equality_errors(this_dummy, close_dummy))
+    p(f"  closest seen input pytree has {len(errs)} mismatches, including:")
+    for path, thing1, thing2, explanation in errs:
+      fst, *path = path  # type: ignore
+      base = ['args', 'kwargs'][fst.idx]
+      p(f"    * at {base}{keystr(path)}, seen {thing2} but now given {thing1},"  # type: ignore
+        f"      so {explanation}")
+    return done()
+
+  # have we never seen these input types (eg shapes, dtypes) before?
+  types_match = [k for k in trees_match if k[1] == in_type]
+  if not types_match:
+    if len(in_type) < 5:
+      in_type_str = ':\n    {}'.format(',  '.join(
+          f'{n}: {ty.str_short(short_dtypes=True)}'
+          for n, ty in zip(debug_info.arg_names, in_type)))
+    else:
+      in_type_str = ''
+    p(f"  never seen input type signature{in_type_str}")
+    dont_match = [t for _, t, *_ in trees_match if t != in_type]
+    closest_ty = min(dont_match, key=lambda t: sum(map(op.ne, t, in_type)))
+    num_mismatch = sum(map(op.ne, closest_ty, in_type))
+    p(f"  closest seen input type signature has {num_mismatch} mismatches, including:")
+    add_weak_type_hint = False
+    for name, ty1, ty2 in zip(debug_info.arg_names, closest_ty, in_type):
+      if ty1 != ty2:
+        if type(ty1) == type(ty2) == core.ShapedArray:
+          s1, s2 = ty1.str_short(True), ty2.str_short(True)
+          if s1 == s2:  # weak types don't show up in str_short()
+            assert ty1.weak_type ^ ty2.weak_type
+            s1 += f'{{weak_type={ty1.weak_type}}}'
+            s2 += f'{{weak_type={ty2.weak_type}}}'
+            add_weak_type_hint = True
+        else:
+          s1, s2 = str(ty1), str(ty2)
+        p(f"    * at {name}, seen {s1}, but now given {s2}")
+    if add_weak_type_hint:
+      p('where weak_type=True often means a Python builtin numeric value, and ')
+      p('weak_type=False means a jax.Array.')
+      p('See https://jax.readthedocs.io/en/latest/type_promotion.html#weak-types')
+    return done()
+
+  # we think this is unreachable...
+  p("explanation unavailable! please open an issue at https://github.com/google/jax")
+  return done()
+
+
+@partial(lu.cache, explain=explain_tracing_cache_miss)
+def _create_pjit_jaxpr(fun, in_type, debug_info, out_paths, ignored_inline):
+  del ignored_inline  # just for explain_cache_miss
   with dispatch.log_elapsed_time(
       "Finished tracing + transforming {fun_name} for pjit in {elapsed_time} sec",
       fun_name=fun.__name__, event=dispatch.JAXPR_TRACE_EVENT):
@@ -936,6 +1035,11 @@ def _create_pjit_jaxpr(fun, in_type, debug_info, out_paths):
 
   if not config.dynamic_shapes.value:
     jaxpr = jaxpr_debug_info(jaxpr, debug_info, out_paths())
+
+  if config.enable_key_reuse_checks.value:
+    # Import here to avoid circular imports
+    from jax.experimental.key_reuse._core import check_key_reuse_jaxpr
+    check_key_reuse_jaxpr(jaxpr)
 
   if any(isinstance(c, core.Tracer) for c in consts):
     closed_jaxpr = pe.close_jaxpr(pe.convert_constvars_jaxpr(jaxpr))
@@ -985,9 +1089,9 @@ def _check_and_canonicalize_out_shardings(
 
 
 def _pjit_jaxpr(fun, out_shardings_thunk, out_layouts_thunk, in_type, debug_info,
-                device_or_backend_set, out_tree, result_paths):
+                device_or_backend_set, out_tree, result_paths, inline):
   jaxpr, final_consts, out_type = _create_pjit_jaxpr(
-      fun, in_type, debug_info, result_paths)
+      fun, in_type, debug_info, result_paths, IgnoreKey(inline))
   canonicalized_out_shardings_flat, out_layouts_flat = _check_and_canonicalize_out_shardings(
       out_shardings_thunk, out_layouts_thunk, out_tree, tuple(out_type),
       jaxpr.jaxpr.debug_info, device_or_backend_set)
@@ -995,8 +1099,17 @@ def _pjit_jaxpr(fun, out_shardings_thunk, out_layouts_thunk, in_type, debug_info
   return jaxpr, final_consts, canonicalized_out_shardings_flat, out_layouts_flat
 
 
+@dataclasses.dataclass(frozen=True)
+class IgnoreKey:
+  val: Any
+  def __hash__(self):
+    return hash(self.__class__)
+  def __eq__(self, other):
+    return isinstance(other, IgnoreKey)  # ignore self.val!
+
+
 def pjit_check_aval_sharding(
-    shardings, flat_avals, names: Optional[tuple[str, ...]],
+    shardings, flat_avals, names: tuple[str, ...] | None,
     what_aval: str, allow_uneven_sharding: bool):
   new_names = [''] * len(shardings) if names is None else names
   for aval, s, name in zip(flat_avals, shardings, new_names):
@@ -1040,7 +1153,7 @@ pjit_p.multiple_results = True
 def _resolve_in_shardings(
     args, pjit_in_shardings: Sequence[PjitSharding],
     out_shardings: Sequence[PjitSharding],
-    pjit_mesh: Optional[pxla.Mesh]) -> Sequence[PjitSharding]:
+    pjit_mesh: pxla.Mesh | None) -> Sequence[PjitSharding]:
   # If True, means that device or backend is set by the user on pjit and it
   # has the same semantics as device_put i.e. doesn't matter which device the
   # arg is on, reshard it to the device mentioned. So don't do any of the
@@ -1235,9 +1348,16 @@ def _pjit_call_impl(*args, jaxpr,
   donated_argnums = [i for i, d in enumerate(donated_invars) if d]
   has_explicit_sharding = _pjit_explicit_sharding(
       in_shardings, out_shardings, None, None)
-  return xc._xla.pjit(name, f, call_impl_cache_miss, [], [], donated_argnums,
-                      tree_util.dispatch_registry,
-                      _get_cpp_global_cache(has_explicit_sharding))(*args)
+  if xla_extension_version >= 226:
+    return xc._xla.pjit(
+        name, f, call_impl_cache_miss, [], [], donated_argnums,
+        tree_util.dispatch_registry,
+        pxla.shard_arg if xla_extension_version >= 229 else pxla.temp_shard_arg,  # type: ignore
+        _get_cpp_global_cache(has_explicit_sharding))(*args)
+  else:
+    return xc._xla.pjit(name, f, call_impl_cache_miss, [], [], donated_argnums,  # type: ignore
+                        tree_util.dispatch_registry,
+                        _get_cpp_global_cache(has_explicit_sharding))(*args)
 
 pjit_p.def_impl(_pjit_call_impl)
 
@@ -1248,7 +1368,7 @@ class SameDeviceAssignmentTuple:
   # device_assignment is Optional because shardings can contain `AUTO` and in
   # that case `mesh` is compulsory to be used. So in that case
   # `_pjit_lower_cached` cache, resource_env will check against the devices.
-  device_assignment: Optional[XLADeviceAssignment]
+  device_assignment: XLADeviceAssignment | None
 
   def __hash__(self):
     shardings_hash = tuple(
@@ -1298,8 +1418,8 @@ def _pjit_lower_cached(
     inline: bool,
     *,
     lowering_parameters: mlir.LoweringParameters,
-    in_layouts: Optional[pxla.MaybeLayout] = None,
-    out_layouts: Optional[pxla.MaybeLayout] = None):
+    in_layouts: pxla.MaybeLayout | None = None,
+    out_layouts: pxla.MaybeLayout | None = None):
   in_shardings: tuple[PjitShardingMinusUnspecified, ...] = cast(
       tuple[PjitShardingMinusUnspecified, ...], sdat_in_shardings.shardings)
   out_shardings: tuple[PjitSharding, ...] = sdat_out_shardings.shardings
@@ -1499,7 +1619,7 @@ batching.axis_primitive_batchers[pjit_p] = partial(_pjit_batcher, False, None)
 pxla.spmd_primitive_batchers[pjit_p] = partial(_pjit_batcher, True, None)
 
 def _pjit_batcher_for_sharding(
-    s: Union[GSPMDSharding, UnspecifiedValue],
+    s: GSPMDSharding | UnspecifiedValue,
     dim: int, val: tuple[str, ...], mesh, ndim: int):
   if is_unspecified(s):
     return s
@@ -1569,7 +1689,7 @@ ad.primitive_jvps[pjit_p] = _pjit_jvp
 
 @weakref_lru_cache
 def _known_jaxpr_fwd(known_jaxpr: core.ClosedJaxpr,
-                     in_fwd: tuple[Optional[int]]) -> core.ClosedJaxpr:
+                     in_fwd: tuple[int | None]) -> core.ClosedJaxpr:
   updated_jaxpr = known_jaxpr.jaxpr.replace(
       outvars=[x for x, i in zip(known_jaxpr.jaxpr.outvars, in_fwd)
                if i is None])
@@ -1761,7 +1881,7 @@ def _dce_jaxpr_pjit(
 
 
 def dce_jaxpr_pjit_rule(used_outputs: list[bool], eqn: core.JaxprEqn
-                        ) -> tuple[list[bool], Optional[core.JaxprEqn]]:
+                        ) -> tuple[list[bool], core.JaxprEqn | None]:
   dced_jaxpr, used_inputs = _dce_jaxpr_pjit(
       eqn.params['jaxpr'], tuple(used_outputs))
 
@@ -2042,7 +2162,7 @@ def get_unconstrained_dims(sharding: NamedSharding):
 
 
 def _fast_path_get_device_assignment(
-    shardings: Iterable[PjitSharding]) -> Optional[XLADeviceAssignment]:
+    shardings: Iterable[PjitSharding]) -> XLADeviceAssignment | None:
   da = None
   for i in shardings:
     if is_unspecified(i):

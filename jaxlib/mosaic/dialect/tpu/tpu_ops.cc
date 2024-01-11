@@ -97,9 +97,8 @@ LogicalResult MemRefSqueezeOp::verify() {
     emitOpError("Memory spaces do not match.");
     return failure();
   }
-  if (target_type.getElementTypeBitWidth() !=
-      source_type.getElementTypeBitWidth()) {
-    this->emitOpError("Element bitwidths do not match in memref_squeeze.");
+  if (target_type.getElementType() != source_type.getElementType()) {
+    this->emitOpError("Element types don't match.");
     return failure();
   }
   auto source_shape = source_type.getShape();
@@ -231,6 +230,50 @@ LogicalResult MaskCastOp::verify() {
                    input_ty.getDimSize(2) < output_ty.getDimSize(2))) &&
                  input_ty.getShape().take_front(2) ==
                      output_ty.getShape().take_front(2));
+  return success();
+}
+
+LogicalResult GetBarrierSemaphoreOp::verify() {
+  auto sem_type = getMemRefType(getResult());
+  if (sem_type.getRank() != 0) {
+    emitOpError("Barrier semaphore reference must be rank 0");
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult SemaphoreSignalOp::verify() {
+  auto sem_type = getMemRefType(getSemaphore());
+  if (sem_type.getRank() != 0) {
+    emitOpError("Semaphore reference must be rank 0");
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult EnqueueDMAOp::verify() {
+  auto source_sem = getSourceSemaphore();
+  if (source_sem) {
+    auto source_sem_type = getMemRefType(getSourceSemaphore());
+    if (source_sem_type.getRank() != 0) {
+      emitOpError("DMA source semaphore reference must be rank 0");
+      return failure();
+    }
+  }
+  auto target_sem_type = getMemRefType(getTargetSemaphore());
+  if (target_sem_type.getRank() != 0) {
+    emitOpError("DMA target semaphore must be rank 0");
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult WaitDMAOp::verify() {
+  auto sem_type = getMemRefType(getSemaphore());
+  if (sem_type.getRank() != 0) {
+    emitOpError("DMA wait semaphore must be rank 0");
+    return failure();
+  }
   return success();
 }
 

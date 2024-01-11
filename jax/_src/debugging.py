@@ -13,11 +13,13 @@
 # limitations under the License.
 """Module for JAX debugging primitives and related functionality."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 import functools
 import string
 import sys
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Union
 import weakref
 
 import numpy as np
@@ -27,7 +29,6 @@ from jax import lax
 
 from jax._src import core
 from jax._src import effects
-from jax._src import linear_util as lu
 from jax._src import mesh as mesh_lib
 from jax._src import sharding_impls
 from jax._src import dispatch
@@ -393,34 +394,6 @@ def inspect_sharding_prop_user_sharding(sharding, backend_string):
   del sharding, backend_string
   return []
 
-def inspect_sharding_partition(shapes, arg_shardings, result_shape,
-                               result_sharding, backend_string):
-  del result_shape, result_sharding
-  sharding_callback_info = sharding_callbacks[backend_string]
-  sharding_callback = sharding_callback_info.callback
-  module_context = sharding_callback_info.module_context
-
-  # Execute callback
-  hlo_sharding, = arg_shardings
-  sharding_callback(hlo_sharding)
-
-  tiled_args = [p.tile(s) for s, p in zip(shapes, arg_shardings)]
-  in_avals = [core.ShapedArray(arg.dimensions(), arg.numpy_dtype())
-              for arg in tiled_args]
-  fun = lu.wrap_init(lambda *args: [])
-  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(fun, in_avals)
-  closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
-  trivial_comp = mlir.build_xla_computation_helper(closed_jaxpr,
-      name="tmp_xla_computation", platforms=module_context.platforms,
-      backend_or_name=module_context.backend_or_name,
-      axis_context=module_context.axis_context)
-  # The trivial computation built here has a dummy tuple as the result,
-  # so use sharding compatible with it for the result sharding.
-  empty_tuple_sharding = xc.OpSharding()
-  empty_tuple_sharding.type = xc.OpSharding.Type.TUPLE
-  result_sharding = xc.HloSharding.from_proto(empty_tuple_sharding)
-  return trivial_comp, arg_shardings, result_sharding
-
 def inspect_sharding_infer_sharding_from_operands(arg_shapes, arg_shardings,
                                                   shape, backend_string):
   del arg_shapes, shape, backend_string
@@ -434,7 +407,7 @@ def _slice_to_chunk_idx(size: int, slc: slice) -> int:
   assert size % slice_size == 0
   return slc.start // slice_size
 
-def _raise_to_slice(slc: Union[slice, int]):
+def _raise_to_slice(slc: slice | int):
   if isinstance(slc, int):
     return slice(slc, slc + 1)
   return slc
@@ -465,7 +438,7 @@ def make_color_iter(color_map, num_rows, num_cols):
 def visualize_sharding(shape: Sequence[int], sharding: Sharding, *,
                        use_color: bool = True, scale: float = 1.,
                        min_width: int = 9, max_width: int = 80,
-                       color_map: Optional[ColorMap] = None):
+                       color_map: ColorMap | None = None):
   """Visualizes a ``Sharding`` using ``rich``."""
   if not RICH_ENABLED:
     raise ValueError("`visualize_sharding` requires `rich` to be installed.")
@@ -491,7 +464,7 @@ def visualize_sharding(shape: Sequence[int], sharding: Sharding, *,
 
   device_indices_map = sharding.devices_indices_map(tuple(shape))
   slices: dict[tuple[int, ...], set[int]] = {}
-  heights: dict[tuple[int, ...], Optional[float]] = {}
+  heights: dict[tuple[int, ...], float | None] = {}
   widths: dict[tuple[int, ...], float] = {}
 
   for i, (dev, slcs) in enumerate(device_indices_map.items()):

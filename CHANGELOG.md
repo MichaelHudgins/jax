@@ -6,7 +6,78 @@ Best viewed [here](https://jax.readthedocs.io/en/latest/changelog.html).
 Remember to align the itemized text with the first line of an item within a list.
 -->
 
-## jax 0.4.22
+## jax 0.4.24
+
+* Changes
+
+  * JAX lowering to StableHLO does not depend on physical devices anymore.
+    If your primitive wraps custom_paritioning or JAX callbacks in the lowering
+    rule i.e. function passed to `rule` parameter of `mlir.register_lowering` then add your
+    primitive to `jax._src.dispatch.prim_requires_devices_during_lowering` set.
+    This is needed because custom_partitioning and JAX callbacks need physical
+    devices to create `Sharding`s during lowering.
+    This is a temporary state until we can create `Sharding`s without physical
+    devices.
+  * {func}`jax.numpy.argsort` and {func}`jax.numpy.sort` now support the `stable`
+    and `descending` arguments.
+  * Several changes to the handling of shape polymorphism (used in
+    {mod}`jax.experimental.jax2tf` and {mod}`jax.experimental.export`):
+    * cleaner pretty-printing of symbolic expressions ({jax-issue}`#19227`)
+    * simplified and faster equality comparisons, where we consider two symbolic dimensions
+      to be equal if the normalized form of their difference reduces to 0
+      ({jax-issue}`#19231`; note that this may result in user-visible behavior
+        changes)
+    * improved the error messages for inconclusive inequality comparisons
+      ({jax-issue}`#19235`)
+    * the `core.non_negative_dim` API (introduced recently)
+      was deprecated and `core.max_dim` and `core.min_dim` were introduced
+      ({jax-issue}`#18953`) to express `max` and `min` for symbolic dimensions.
+      You can use `core.max_dim(d, 0)` instead of `core.non_negative_dim(d)`.
+    * the `shape_poly.is_poly_dim` is deprecated in favor if `export.is_symbolic_dim`
+      ({jax-issue}`#19282`).
+  * Refactored the API for `jax.experimental.export`. Instead of
+    `from jax.experimental.export import export` you should use now
+    `from jax.experimental import export`. The old way of importing will
+    continue to work for a deprecation period of 3 months.
+
+* Deprecations & Removals
+  * A number of previously deprecated functions have been removed, following a
+    standard 3+ month deprecation cycle (see {ref}`api-compatibility`).
+    This includes:
+    * The `jax.linear_util` submodule and all its contents.
+    * The `jax.prng` submodule and all its contents.
+    * From {mod}`jax.random`: `PRNGKeyArray`, `KeyArray`, `threefry2x32_key`,
+      `rbg_key`, and `unsafe_rbg_key`.
+    * From {mod}`jax.tree_util`: `register_keypaths`, `AttributeKeyPathEntry`, and
+      `GetItemKeyPathEntry`.
+    * from {mod}`jax.interpreters.xla`: `backend_specific_translations`, `translations`,
+      `register_translation`, `xla_destructure`, `TranslationRule`, `TranslationContext`,
+      `axis_groups`, `ShapedArray`, `ConcreteArray`, `AxisEnv`, `backend_compile`,
+      and `XLAOp`.
+    * from {mod}`jax.numpy`: `NINF`, `NZERO`, `PZERO`, `row_stack`, `issubsctype`,
+      `trapz`, and `in1d`.
+    * from {mod}`jax.scipy.linalg`: `tril` and `triu`.
+  * The previously-deprecated method `PRNGKeyArray.unsafe_raw_array` has been
+    removed. Use {func}`jax.random.key_data` instead.
+  * `bool(empty_array)` now raises an error rather than returning `False`. This
+    previously raised a deprecation warning, and follows a similar change in NumPy.
+
+## jaxlib 0.4.24
+
+* Changes
+
+  * `cost_analysis` now works with cross-compiled `Compiled` objects (i.e. when
+    using `.lower().compile()` with a topology object, e.g., to compile for
+    Cloud TPU from a non-TPU computer).
+
+## jax 0.4.23 (Dec 13, 2023)
+
+## jaxlib 0.4.23 (Dec 13, 2023)
+
+* Fixed a bug that caused verbose logging from the GPU compiler during
+  compilation.
+
+## jax 0.4.22 (Dec 13, 2023)
 
 * Deprecations
   * The `device_buffer` and `device_buffers` properties of JAX arrays are deprecated.
@@ -15,7 +86,7 @@ Remember to align the itemized text with the first line of an item within a list
     * `arr.device_buffer` becomes `arr.addressable_data(0)`
     * `arr.device_buffers` becomes `[x.data for x in arr.addressable_shards]`
 
-## jaxlib 0.4.22
+## jaxlib 0.4.22 (Dec 13, 2023)
 
 ## jax 0.4.21 (Dec 4 2023)
 
@@ -114,6 +185,7 @@ Remember to align the itemized text with the first line of an item within a list
     automatically. Currently, NCCL 2.16 or newer is required.
   * We now provide Linux aarch64 wheels, both with and without NVIDIA GPU
     support.
+  * {meth}`jax.Array.item` now supports optional index arguments.
 
 * Deprecations
   * A number of internal utilities and inadvertent exports in {mod}`jax.lax` have

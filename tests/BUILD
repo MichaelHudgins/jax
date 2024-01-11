@@ -153,6 +153,31 @@ jax_test(
 )
 
 jax_test(
+    name = "gpu_memory_flags_test_no_preallocation",
+    srcs = ["gpu_memory_flags_test.py"],
+    disable_backends = [
+        "cpu",
+        "tpu",
+    ],
+    env = {
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "0",
+    },
+    main = "gpu_memory_flags_test.py",
+)
+
+jax_test(
+    name = "gpu_memory_flags_test",
+    srcs = ["gpu_memory_flags_test.py"],
+    disable_backends = [
+        "cpu",
+        "tpu",
+    ],
+    env = {
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "1",
+    },
+)
+
+jax_test(
     name = "lobpcg_test",
     srcs = ["lobpcg_test.py"],
     env = {"LOBPCG_EMIT_DEBUG_PLOTS": "1"},
@@ -235,6 +260,14 @@ jax_test(
     name = "layout_test",
     srcs = ["layout_test.py"],
     tags = ["multiaccelerator"],
+)
+
+jax_test(
+    name = "shard_alike_test",
+    srcs = ["shard_alike_test.py"],
+    deps = [
+        "//jax:experimental",
+    ],
 )
 
 jax_test(
@@ -1113,6 +1146,11 @@ jax_test(
 )
 
 jax_test(
+    name = "key_reuse_test",
+    srcs = ["key_reuse_test.py"],
+)
+
+jax_test(
     name = "x64_context_test",
     srcs = ["x64_context_test.py"],
     deps = [
@@ -1230,6 +1268,7 @@ jax_test(
         "notsan",
     ],  # Times out under *SAN.
     deps = [
+        "//jax:experimental",
         "//jax:tree_util",
     ],
 )
@@ -1350,6 +1389,16 @@ jax_test(
     deps = [
         "//jax:internal_test_harnesses",
         "//jax/experimental/export",
+    ],
+)
+
+jax_test(
+    name = "export_back_compat_test",
+    srcs = ["export_back_compat_test.py"],
+    tags = [],
+    deps = [
+        "//jax:internal_export_back_compat_test_data",
+        "//jax:internal_export_back_compat_test_util",
     ],
 )
 

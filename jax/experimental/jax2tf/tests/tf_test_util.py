@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 import contextlib
 import dataclasses
-import functools
 import re
 import os
 from typing import Any, Callable, Optional
@@ -30,7 +31,7 @@ from jax._src import test_util as jtu
 from jax import tree_util
 
 from jax.experimental import jax2tf
-from jax.experimental.export import export
+from jax.experimental import export
 from jax._src import config
 from jax._src import xla_bridge
 import numpy as np
@@ -91,8 +92,8 @@ def SaveAndLoadModel(model: tf.Module,
   return restored_model
 
 def SaveAndLoadFunction(f_tf: Callable, *,
-                        input_signature: Optional[Sequence[tf.TensorSpec]] = None,
-                        input_args: Optional[Sequence[Any]] = None,
+                        input_signature: Sequence[tf.TensorSpec] | None = None,
+                        input_args: Sequence[Any] | None = None,
                         variables: Sequence[tf.Variable] = (),
                         save_gradients=True) -> tuple[Callable, tf.train.Checkpoint]:
   # Roundtrip through saved model on disk. Return the Checkpoint also
@@ -156,7 +157,8 @@ def ComputeTfValueAndGrad(tf_f: Callable, tf_args: Sequence,
 # TODO(necula): clean up the test harnesses to not require these flags
 @jtu.with_config(jax_numpy_rank_promotion="allow",
                  jax_numpy_dtype_promotion='standard',
-                 jax_legacy_prng_key="allow")
+                 jax_legacy_prng_key="allow",
+                 jax_enable_key_reuse_checks=False)
 class JaxToTfTestCase(jtu.JaxTestCase):
   # We want most tests to use the maximum available version, from the locally
   # installed tfxla module and export.
@@ -364,7 +366,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     return result_jax, result_tf
 
   def TransformConvertAndCompare(self, func: Callable, arg,
-                                 transform: Optional[str]):
+                                 transform: str | None):
     """Like ConvertAndCompare but first applies a transformation.
 
     `func` must be a function from one argument to one result. `arg` is

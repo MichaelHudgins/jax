@@ -209,18 +209,26 @@ def _spec_rank_error(
     prefix, base = 'out', f'{fun_name}(*args)'
   msgs = []
   for (spec_key, spec), (fail_key, aval) in _iter_paths(tree, specs, fails):
+    extra = ""
     if error_type == SpecErrorType.input and ba is not None:
       arg_key, *_ = fail_key
-      extra = (f", where {base}[{arg_key}] is bound to {fun_name}'s "
-               f"parameter '{list(ba.arguments.keys())[arg_key.idx]}',")
-    else:
-      extra = ""
+      if arg_key.idx < len(ba.arguments):
+        param_name = list(ba.arguments.keys())[arg_key.idx]
+        extra = (f", where {base}{arg_key} is bound to {fun_name}'s "
+                 f"parameter '{param_name}',")
+      else:
+        param = list(ba.signature.parameters.values())[-1]
+        assert param.kind == inspect.Parameter.VAR_POSITIONAL
+        extra = (f", where {base}{arg_key} is the index "
+                 f"{arg_key.idx - len(ba.signature.parameters) + 1} component "
+                 f"of {fun_name}'s varargs parameter '{param.name}',")
     msgs.append(
         f"* {prefix}_specs{keystr(spec_key)} is {spec} which has length "
         f"{len(spec)}, but "
         f"{base}{keystr(fail_key)}{extra} has shape {aval.str_short()}, "
         f"which has rank {aval.ndim} (and {aval.ndim} < {len(spec)})")
   assert msgs
+  if len(msgs) == 1: msgs = [msgs[0][2:]]  # remove the bullet point
   msg = (f"shard_map applied to the function '{fun_name}' was given an "
          f"{prefix}_specs entry which is too long to be compatible with the "
          f"corresponding {prefix}put value from the function:\n\n"
@@ -241,10 +249,19 @@ def _spec_divisibility_error(
   fun_name = getattr(f, '__name__', str(f))
   msgs = []
   for (spec_key, spec), (fail_key, aval) in _iter_paths(tree, specs, fails):
+    extra = ""
     if ba is not None:
       arg_key, *_ = fail_key
-      extra = (f", where args[{arg_key}] is bound to {fun_name}'s "
-               f"parameter '{list(ba.arguments.keys())[arg_key.idx]}',")
+      if arg_key.idx < len(ba.arguments):
+        param_name = list(ba.arguments.keys())[arg_key.idx]
+        extra = (f", where args{arg_key} is bound to {fun_name}'s "
+                 f"parameter '{param_name}',")
+      else:
+        param = list(ba.signature.parameters.values())[-1]
+        assert param.kind == inspect.Parameter.VAR_POSITIONAL
+        extra = (f", where args{arg_key} is the index "
+                 f"{arg_key.idx - len(ba.signature.parameters) + 1} component "
+                 f"of {fun_name}'s varargs parameter '{param.name}',")
     names = _canonicalize_spec(spec)
     for d, ns in names.items():
       if aval.shape[d] % prod(mesh.shape[n] for n in ns):
@@ -258,6 +275,7 @@ def _spec_divisibility_error(
             f"{axis} (of {total}size {sz}), but {sz} does not evenly divide "
             f"{aval.shape[d]}")
   assert msgs
+  if len(msgs) == 1: msgs = [msgs[0][2:]]  # remove the bullet point
   msg = (f"shard_map applied to the function '{fun_name}' was given argument "
          f"arrays with axis sizes that are not evenly divisible by the "
          f"corresponding mesh axis sizes:\n\n"
@@ -294,6 +312,7 @@ def _inout_rep_error(f: Callable, mesh: Mesh, tree: PyTreeDef, specs: Specs,
           f"corresponding output value is replicated across mesh axis "
           f"'{need_rep_}', but could not infer replication over any axes")
   assert msgs
+  if len(msgs) == 1: msgs = [msgs[0][2:]]  # remove the bullet point
   msg = (f"shard_map applied to the function '{fun_name}' was given "
          f"out_specs which require replication which can't be statically "
          f"inferred given the mesh:\n\n"
@@ -456,7 +475,7 @@ def _unshard_aval(mesh: Mesh, names: AxisNames, aval: core.AbstractValue
 
 # Type-checking
 
-RepType = Optional[set[AxisName]]
+RepType = Union[set[AxisName], None]
 
 def _shard_map_typecheck(_, *in_atoms, jaxpr, mesh, in_names, out_names,
                          check_rep, rewrite, auto):
@@ -590,8 +609,8 @@ def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk,
   _check_names(out_names_thunk(), out_avals)  # pytype: disable=wrong-arg-types
   if check_rep:
     _check_reps(mesh, out_names_thunk(), out_rep())
-  return map(partial(_match_spec, mesh, check_rep),
-             out_rep(), out_names_thunk(), outs)
+  pspecs = map(_names_to_pspec, out_names_thunk())
+  return map(partial(_match_spec, mesh, check_rep), pspecs, outs)
 core.EvalTrace.process_shard_map = _shard_map_impl
 
 @lu.transformation_with_aux
@@ -606,7 +625,8 @@ def _shmap_subtrace(main, in_rep, *in_vals):
 
 def _names_to_pspec(names: AxisNames) -> PartitionSpec:
   ndmin = max(names) + 1 if names else 0
-  return PartitionSpec(*(names.get(i) for i in range(ndmin)))
+  unpack = lambda t: t[0] if t is not None and len(t) == 1 else t
+  return PartitionSpec(*(unpack(names.get(i)) for i in range(ndmin)))
 
 def _unmatch_spec(mesh: Mesh, src: AxisNames, x: JaxType) -> JaxType:
   with core.eval_context():
@@ -636,16 +656,15 @@ def _check_reps2(mesh, reps_dest, reps):
   if any(f is not no_fail for f in fail): raise _RepError(fail)
 
 def _match_spec(mesh: Mesh, check_rep: bool,
-                rep: RepType, dst: AxisNames, x: JaxType) -> JaxType:
-  fn = HashablePartial(_match, mesh, check_rep, tuple(dst.items()))
+                pspec: PartitionSpec, x: JaxType) -> JaxType:
+  fn = HashablePartial(_match, mesh, check_rep, pspec)
   with core.eval_context():
-    return jax.jit(fn)(x)
+    return jax.jit(fn, out_shardings=NamedSharding(mesh, pspec))(x)
 
-def _match(mesh, check_rep, dst_tup, x):
+def _match(mesh, check_rep, pspec, x):
   src = P(mesh.axis_names)
-  dst = _names_to_pspec(dict(dst_tup))
   # TODO put back (?) needed for rep checking in eager? for now test rewrite
-  return shard_map(_rem_singleton, mesh, (src,), dst, check_rep=False)(x)
+  return shard_map(_rem_singleton, mesh, (src,), pspec, check_rep=False)(x)
 
 def _rem_singleton(x): return x.reshape(x.shape[1:])
 def _add_singleton(x): return x.reshape(1, *x.shape)
@@ -698,7 +717,9 @@ class ShardMapTrace(core.Trace):
   def process_custom_jvp_call(self, prim, fun, jvp, tracers, *, symbolic_zeros):
     # Since ShardMapTrace is only used as a base main, we can drop the jvp.
     if symbolic_zeros:
-      msg = "Please open an issue at https://github.com/google/jax/issues !"
+      msg = ("custom_jvp symbolic_zeros support with shard_map is not "
+             "implemented; please open an issue at "
+             "https://github.com/google/jax/issues")
       raise NotImplementedError(msg)
     del prim, jvp, symbolic_zeros
     in_vals, in_rep = unzip2((t.val, t.rep) for t in tracers)
@@ -714,7 +735,9 @@ class ShardMapTrace(core.Trace):
                               symbolic_zeros):
     # Since ShardMapTrace is only used as a base main, we can drop the jvp.
     if symbolic_zeros:
-      msg = "Please open an issue at https://github.com/google/jax/issues !"
+      msg = ("custom_vjp symbolic_zeros support with shard_map is not "
+             "implemented; please open an issue at "
+             "https://github.com/google/jax/issues")
       raise NotImplementedError(msg)
     del prim, fwd, bwd, out_trees, symbolic_zeros
     in_vals, in_rep = unzip2((t.val, t.rep) for t in tracers)
@@ -879,7 +902,8 @@ def _standard_check(prim, mesh, *in_rep, **__):
   if in_rep_ and not in_rep_[:-1] == in_rep_[1:]:
     raise Exception(f"Primitive {prim} requires argument replication types "
                     f"to match, but got {in_rep}. Please open an issue at "
-                    "https://github.com/google/jax/issues")
+                    "https://github.com/google/jax/issues and as a temporary "
+                    "workaround pass the check_rep=False argument to shard_map")
   return in_rep_[0] if in_rep_ else None
 
 def register_standard_collective(prim):
@@ -893,7 +917,8 @@ def _standard_collective_check(prim, mesh, x_rep, *, axis_name, **params):
     raise Exception(f"Collective {prim} must be applied to a device-varying "
                     f"replication type, but got {x_rep} for collective acting "
                     f"over axis name {axis_name}. Please open an issue at "
-                    "https://github.com/google/jax/issues")
+                    "https://github.com/google/jax/issues and as a temporary "
+                    "workaround pass the check_rep=False argument to shard_map")
   return x_rep
 
 def _standard_collective_rewrite(prim, mesh, in_rep, x, axis_name, **params):
@@ -916,6 +941,12 @@ for o in it.chain(lax.__dict__.values(), slicing.__dict__.values(),
   if isinstance(o, core.Primitive):
     register_standard_check(o)
     register_standard_rewrite(o)
+
+for p in [control_flow.loops.cumsum_p, control_flow.loops.cumlogsumexp_p,
+          control_flow.loops.cumprod_p, control_flow.loops.cummax_p,
+          control_flow.loops.cummin_p]:
+  register_standard_check(p)
+  register_standard_rewrite(p)
 
 
 @register_check(lax_parallel.psum_p)
@@ -941,7 +972,8 @@ def _psum2_check(mesh, *in_rep, axes, axis_index_groups):
     raise Exception("Collective psum must be applied to a device-varying "
                     f"replication type, but got {in_rep} for collective acting "
                     f"over axis name {axes}. Please open an issue at "
-                    "https://github.com/google/jax/issues")
+                    "https://github.com/google/jax/issues, and as a temporary "
+                    "workaround pass the check_rep=False argument to shard_map")
   in_rep = tuple(set(mesh.axis_names) if r is None else r for r in in_rep)
   return [r | set(axes) for r in in_rep]
 register_norewrite(psum2_p)
@@ -955,7 +987,8 @@ def _pbroadcast_check(mesh, *in_rep, axes, axis_index_groups):
                     "non-device-varying "
                     f"replication type, but got {in_rep} for collective acting "
                     f"over axis name {axes}. Please open an issue at "
-                    "https://github.com/google/jax/issues")
+                    "https://github.com/google/jax/issues, and as a temporary "
+                    "workaround pass the check_rep=False argument to shard_map")
   in_rep = tuple(set(mesh.axis_names) if r is None else r for r in in_rep)
   return [r - set(axes) for r in in_rep]
 register_norewrite(pbroadcast_p)
@@ -1041,7 +1074,9 @@ def _scan_check(mesh, *in_rep, jaxpr, num_consts, num_carry, **_):
   if not carry_rep_in == carry_rep_out:
     raise Exception("Scan carry input and output got mismatched replication "
                     f"types {carry_rep_in} and {carry_rep_out}. Please open an "
-                    "issue at https://github.com/google/jax/issues")
+                    "issue at https://github.com/google/jax/issues, and as a "
+                    "temporary workaround pass the check_rep=False argument to "
+                    "shard_map")
   return out_rep
 
 @register_rewrite(control_flow.loops.scan_p)
@@ -1090,7 +1125,9 @@ def _custom_vjp_call_jaxpr_rewrite(
     mesh, in_rep, *args, fun_jaxpr, fwd_jaxpr_thunk, bwd, num_consts, out_trees,
     symbolic_zeros):
   if symbolic_zeros:
-    msg = "Please open an issue at https://github.com/google/jax/issues !"
+    msg = ("Please open an issue at https://github.com/google/jax/issues and as"
+           " a temporary workaround pass the check_rep=False argument to "
+           "shard_map")
     raise NotImplementedError(msg)
 
   fun_jaxpr_, out_rep = _replication_rewrite_nomatch(mesh, fun_jaxpr, in_rep)
@@ -1653,7 +1690,9 @@ class RewriteTrace(core.Trace):
 
   def process_custom_jvp_call(self, prim, fun, jvp, tracers, *, symbolic_zeros):
     if symbolic_zeros:
-      msg = "Please open an issue at https://github.com/google/jax/issues !"
+      msg = ("Please open an issue at https://github.com/google/jax/issues and "
+             "as a temporary workaround pass the check_rep=False argument to "
+             "shard_map")
       raise NotImplementedError(msg)
     in_vals, in_reps = unzip2((t.val, t.rep) for t in tracers)
     fun, out_reps1 = _rewrite_subtrace(fun, self.main, in_reps)
@@ -1672,7 +1711,9 @@ class RewriteTrace(core.Trace):
   def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, out_trees,
                               symbolic_zeros):
     if symbolic_zeros:
-      msg = "Please open an issue at https://github.com/google/jax/issues !"
+      msg = ("Please open an issue at https://github.com/google/jax/issues and "
+             "as a temporary workaround pass the check_rep=False argument to "
+             "shard_map")
       raise NotImplementedError(msg)
     in_vals, in_reps = unzip2((t.val, t.rep) for t in tracers)
     fun, out_reps1 = _rewrite_subtrace(fun, self.main, in_reps)

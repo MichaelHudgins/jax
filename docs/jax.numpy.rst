@@ -47,6 +47,8 @@ namespace; they are listed below.
     ndarray.at
     abs
     absolute
+    acos
+    acosh
     add
     all
     allclose
@@ -78,7 +80,12 @@ namespace; they are listed below.
     array_split
     array_str
     asarray
+    asin
+    asinh
     astype
+    atan
+    atanh
+    atan2
     atleast_1d
     atleast_2d
     atleast_3d
@@ -87,8 +94,11 @@ namespace; they are listed below.
     bincount
     bitwise_and
     bitwise_count
+    bitwise_invert
+    bitwise_left_shift
     bitwise_not
     bitwise_or
+    bitwise_right_shift
     bitwise_xor
     blackman
     block
@@ -207,7 +217,6 @@ namespace; they are listed below.
     identity
     iinfo
     imag
-    in1d
     index_exp
     indices
     inexact
@@ -304,6 +313,7 @@ namespace; they are listed below.
     pad
     partition
     percentile
+    permute_dims
     piecewise
     place
     poly
@@ -316,6 +326,7 @@ namespace; they are listed below.
     polysub
     polyval
     positive
+    pow
     power
     printoptions
     prod
@@ -379,7 +390,6 @@ namespace; they are listed below.
     tile
     trace
     transpose
-    trapz
     tri
     tril
     tril_indices
@@ -398,6 +408,10 @@ namespace; they are listed below.
     uint8
     union1d
     unique
+    unique_all
+    unique_counts
+    unique_inverse
+    unique_values
     unpackbits
     unravel_index
     unsignedinteger
@@ -405,6 +419,7 @@ namespace; they are listed below.
     vander
     var
     vdot
+    vecdot
     vectorize
     vsplit
     vstack
@@ -449,6 +464,7 @@ jax.numpy.linalg
 
   cholesky
   cond
+  cross
   det
   eig
   eigh
@@ -456,17 +472,25 @@ jax.numpy.linalg
   eigvalsh
   inv
   lstsq
+  matmul
+  matrix_norm
   matrix_power
   matrix_rank
+  matrix_transpose
   multi_dot
   norm
+  outer
   pinv
   qr
   slogdet
   solve
   svd
+  svdvals
+  tensordot
   tensorinv
   tensorsolve
+  vector_norm
+  vecdot
 
 JAX Array
 ---------

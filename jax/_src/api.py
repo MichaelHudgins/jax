@@ -63,6 +63,7 @@ from jax._src.api_util import (
 from jax._src.lax import lax as lax_internal
 from jax._src.lib import jax_jit
 from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
 from jax._src.lib import pmap_lib
 from jax._src.sharding import Sharding
 from jax._src.sharding_impls import (PmapSharding, TransferToMemoryKind,
@@ -1415,10 +1416,10 @@ def pmap(
       Operations that only depend on static arguments will be constant-folded.
       Calling the pmapped function with different values for these constants
       will trigger recompilation. If the pmapped function is called with fewer
-      positional arguments than indicated by ``static_argnums`` then an error is
-      raised. Each of the static arguments will be broadcasted to all devices.
-      Arguments that are not arrays or containers thereof must be marked as
-      static. Defaults to ().
+      positional arguments than indicated by ``static_broadcasted_argnums`` then
+      an error is raised. Each of the static arguments will be broadcasted to
+      all devices. Arguments that are not arrays or containers thereof must be
+      marked as static. Defaults to ().
 
       Static arguments must be hashable, meaning both ``__hash__`` and
       ``__eq__`` are implemented, and should be immutable.
@@ -1845,7 +1846,8 @@ def _cpp_pmap(
     return out, fastpath_data
 
   cpp_mapped_f = pmap_lib.pmap(
-      fun, cache_miss, static_broadcasted_tuple, pxla.shard_arg,
+      fun, cache_miss, static_broadcasted_tuple,
+      pxla.shard_arg if xla_extension_version >= 229 else pxla.temp_shard_arg,  # type: ignore
       pytree_registry=tree_util.default_registry)
   _pmap_cache_clears.add(cpp_mapped_f)
 
@@ -2812,6 +2814,24 @@ def eval_shape(fun: Callable, *args, **kwargs):
   >>> out = jax.eval_shape(f, A, x)  # no FLOPs performed
   >>> print(out.shape)
   (2000, 1000)
+  >>> print(out.dtype)
+  float32
+
+  All arguments passed via :func:`eval_shape` will be treated as dynamic;
+  static arguments can be included via closure, for example using :func:`functools.partial`:
+
+  >>> import jax
+  >>> from jax import lax
+  >>> from functools import partial
+  >>> import jax.numpy as jnp
+  >>>
+  >>> x = jax.ShapeDtypeStruct((1, 1, 28, 28), jnp.float32)
+  >>> kernel = jax.ShapeDtypeStruct((32, 1, 3, 3), jnp.float32)
+  >>>
+  >>> conv_same = partial(lax.conv_general_dilated, window_strides=(1, 1), padding="SAME")
+  >>> out = jax.eval_shape(conv_same, x, kernel)
+  >>> print(out.shape)
+  (1, 32, 28, 28)
   >>> print(out.dtype)
   float32
   """

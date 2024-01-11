@@ -43,8 +43,8 @@ class SegmentIds(NamedTuple):
     kv: segment ids along the KV sequence.
   """
 
-  q: jax.Array  # [q_seq_len]
-  kv: jax.Array  # [kv_seq_len]
+  q: jax.Array  # [batch_size, q_seq_len]
+  kv: jax.Array  # [batch_size, kv_seq_len]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,6 +174,23 @@ def flash_attention(
     raise ValueError(
         f"KV sequence length mismatch: got {kv_seq_len} and {kv_seq_len_v}"
     )
+  if ab is not None:
+    if ab.shape != (batch_size, num_heads, q_seq_len, kv_seq_len):
+      raise ValueError(
+          f"Attention bias shape mismatch: expected ({batch_size=},"
+          f" {num_heads=}, {q_seq_len=}, {kv_seq_len=}), got {ab.shape}"
+      )
+  if segment_ids is not None:
+    if segment_ids.q.shape != (batch_size, q_seq_len):
+      raise ValueError(
+          f"Q segment ids shape mismatch: expected ({batch_size=},"
+          f" {q_seq_len=},), got {segment_ids.q.shape}"
+      )
+    if segment_ids.kv.shape != (batch_size, kv_seq_len):
+      raise ValueError(
+          f"KV segment ids shape mismatch: expected ({batch_size=},"
+          f" {kv_seq_len=},), got {segment_ids.kv.shape}"
+      )
   if block_sizes is None:
     block_sizes = BlockSizes.get_default(
         batch_size, num_heads, q_seq_len, kv_seq_len, d_model
@@ -876,7 +893,7 @@ def _flash_attention_dkv_kernel(
       pl.store(dk_scratch_ref, (pl.ds(start_k, block_k), slice(None)),
                pl.load(dk_scratch_ref, (pl.ds(start_k, block_k), slice(None)))
                + dk.astype(dk_scratch_ref.dtype))
-    lax.fori_loop(0, block_k_major // block_k, k_body, None)
+    lax.fori_loop(0, block_k_major // block_k, k_body, None, unroll=True)
 
   if causal:
     should_run = below_or_on_diag(
@@ -887,7 +904,7 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(should_run)
   def run():
-    lax.fori_loop(0, block_q_major // block_q, q_body, None)
+    lax.fori_loop(0, block_q_major // block_q, q_body, None, unroll=True)
 
   @pl.when(q_seq_index == q_seq_len // block_q_major - 1)
   def end_of_q_sequence():
@@ -1234,7 +1251,7 @@ def _flash_attention_dq_kernel(
 
   @pl.when(should_run)
   def run():
-    lax.fori_loop(0, block_k_major // block_k, body, None)
+    lax.fori_loop(0, block_k_major // block_k, body, None, unroll=True)
 
   @pl.when(should_not_run)
   def zero_out_ds():

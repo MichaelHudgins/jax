@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import partial
 
 import numpy as np
 import textwrap
 import operator
-from typing import Literal, Optional, Union, cast, overload
+from typing import Literal, cast, overload
 
 import jax
 from jax import jit, custom_jvp
@@ -61,12 +63,12 @@ def svd(a: ArrayLike, full_matrices: bool, compute_uv: Literal[False],
         hermitian: bool = False) -> Array: ...
 @overload
 def svd(a: ArrayLike, full_matrices: bool = True, compute_uv: bool = True,
-        hermitian: bool = False) -> Union[Array, tuple[Array, Array, Array]]: ...
+        hermitian: bool = False) -> Array | tuple[Array, Array, Array]: ...
 
 @_wraps(np.linalg.svd)
 @partial(jit, static_argnames=('full_matrices', 'compute_uv', 'hermitian'))
 def svd(a: ArrayLike, full_matrices: bool = True, compute_uv: bool = True,
-        hermitian: bool = False) -> Union[Array, tuple[Array, Array, Array]]:
+        hermitian: bool = False) -> Array | tuple[Array, Array, Array]:
   check_arraylike("jnp.linalg.svd", a)
   a, = promote_dtypes_inexact(jnp.asarray(a))
   if hermitian:
@@ -129,7 +131,7 @@ def matrix_power(a: ArrayLike, n: int) -> Array:
 
 @_wraps(np.linalg.matrix_rank)
 @jit
-def matrix_rank(M: ArrayLike, tol: Optional[ArrayLike] = None) -> Array:
+def matrix_rank(M: ArrayLike, tol: ArrayLike | None = None) -> Array:
   check_arraylike("jnp.linalg.matrix_rank", M)
   M, = promote_dtypes_inexact(jnp.asarray(M))
   if M.ndim < 2:
@@ -193,7 +195,7 @@ def _slogdet_qr(a: Array) -> tuple[Array, Array]:
         LU decomposition if ``None``.
     """))
 @partial(jit, static_argnames=('method',))
-def slogdet(a: ArrayLike, *, method: Optional[str] = None) -> tuple[Array, Array]:
+def slogdet(a: ArrayLike, *, method: str | None = None) -> tuple[Array, Array]:
   check_arraylike("jnp.linalg.slogdet", a)
   a, = promote_dtypes_inexact(jnp.asarray(a))
   a_shape = jnp.shape(a)
@@ -382,7 +384,7 @@ def eigvals(a: ArrayLike) -> Array:
 
 @_wraps(np.linalg.eigh)
 @partial(jit, static_argnames=('UPLO', 'symmetrize_input'))
-def eigh(a: ArrayLike, UPLO: Optional[str] = None,
+def eigh(a: ArrayLike, UPLO: str | None = None,
          symmetrize_input: bool = True) -> tuple[Array, Array]:
   check_arraylike("jnp.linalg.eigh", a)
   if UPLO is None or UPLO == "L":
@@ -400,7 +402,7 @@ def eigh(a: ArrayLike, UPLO: Optional[str] = None,
 
 @_wraps(np.linalg.eigvalsh)
 @partial(jit, static_argnames=('UPLO',))
-def eigvalsh(a: ArrayLike, UPLO: Optional[str] = 'L') -> Array:
+def eigvalsh(a: ArrayLike, UPLO: str | None = 'L') -> Array:
   check_arraylike("jnp.linalg.eigvalsh", a)
   w, _ = eigh(a, UPLO)
   return w
@@ -413,7 +415,7 @@ def eigvalsh(a: ArrayLike, UPLO: Optional[str] = 'L') -> Array:
     `10. * max(num_rows, num_cols) * jnp.finfo(dtype).eps`.
     """))
 @partial(jit, static_argnames=('hermitian',))
-def pinv(a: ArrayLike, rcond: Optional[ArrayLike] = None,
+def pinv(a: ArrayLike, rcond: ArrayLike | None = None,
          hermitian: bool = False) -> Array:
   # Uses same algorithm as
   # https://github.com/numpy/numpy/blob/v1.17.0/numpy/linalg/linalg.py#L1890-L1979
@@ -481,8 +483,8 @@ def inv(a: ArrayLike) -> Array:
 
 @_wraps(np.linalg.norm)
 @partial(jit, static_argnames=('ord', 'axis', 'keepdims'))
-def norm(x: ArrayLike, ord: Union[int, str, None] = None,
-         axis: Union[None, tuple[int, ...], int] = None,
+def norm(x: ArrayLike, ord: int | str | None = None,
+         axis: None | tuple[int, ...] | int = None,
          keepdims: bool = False) -> Array:
   check_arraylike("jnp.linalg.norm", x)
   x, = promote_dtypes_inexact(jnp.asarray(x))
@@ -579,11 +581,11 @@ def norm(x: ArrayLike, ord: Union[int, str, None] = None,
 @overload
 def qr(a: ArrayLike, mode: Literal["r"]) -> Array: ...
 @overload
-def qr(a: ArrayLike, mode: str = "reduced") -> Union[Array, tuple[Array, Array]]: ...
+def qr(a: ArrayLike, mode: str = "reduced") -> Array | tuple[Array, Array]: ...
 
 @_wraps(np.linalg.qr)
 @partial(jit, static_argnames=('mode',))
-def qr(a: ArrayLike, mode: str = "reduced") -> Union[Array, tuple[Array, Array]]:
+def qr(a: ArrayLike, mode: str = "reduced") -> Array | tuple[Array, Array]:
   check_arraylike("jnp.linalg.qr", a)
   a, = promote_dtypes_inexact(jnp.asarray(a))
   if mode == "raw":
@@ -606,12 +608,16 @@ def qr(a: ArrayLike, mode: str = "reduced") -> Union[Array, tuple[Array, Array]]
 def solve(a: ArrayLike, b: ArrayLike) -> Array:
   check_arraylike("jnp.linalg.solve", a, b)
   a, b = promote_dtypes_inexact(jnp.asarray(a), jnp.asarray(b))
-  if a.ndim >= 2 and b.ndim > a.ndim:
-    a = lax.expand_dims(a, tuple(range(b.ndim - a.ndim)))
-  return lax_linalg._solve(a, b)
+  # TODO(jakevdp): this condition matches the broadcasting behavior in numpy < 2.0.
+  # For the array API specification, we would check only if b.ndim == 1.
+  if b.ndim == 1 or a.ndim == b.ndim + 1:
+    signature = "(m,m),(m)->(m)"
+  else:
+    signature = "(m,m),(m,n)->(m,n)"
+  return jnp.vectorize(lax_linalg._solve, signature=signature)(a, b)
 
 
-def _lstsq(a: ArrayLike, b: ArrayLike, rcond: Optional[float], *,
+def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
            numpy_resid: bool = False) -> tuple[Array, Array, Array, Array]:
   # TODO: add lstsq to lax_linalg and implement this function via those wrappers.
   # TODO: add custom jvp rule for more robust lstsq differentiation
@@ -671,9 +677,83 @@ _jit_lstsq = jit(partial(_lstsq, numpy_resid=False))
     The lstsq function does not currently have a custom JVP rule, so the gradient is
     poorly behaved for some inputs, particularly for low-rank `a`.
     """))
-def lstsq(a: ArrayLike, b: ArrayLike, rcond: Optional[float] = None, *,
+def lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None = None, *,
           numpy_resid: bool = False) -> tuple[Array, Array, Array, Array]:
   check_arraylike("jnp.linalg.lstsq", a, b)
   if numpy_resid:
     return _lstsq(a, b, rcond, numpy_resid=True)
   return _jit_lstsq(a, b, rcond)
+
+
+@_wraps(getattr(np.linalg, "cross", None))
+def cross(x1: ArrayLike, x2: ArrayLike, /, *, axis=-1):
+  check_arraylike("jnp.linalg.outer", x1, x2)
+  x1, x2 = jnp.asarray(x1), jnp.asarray(x2)
+  if x1.shape[axis] != 3 or x2.shape[axis] != 3:
+    raise ValueError(
+        "Both input arrays must be (arrays of) 3-dimensional vectors, "
+        f"but they have {x1.shape[axis]=} and {x2.shape[axis]=}"
+    )
+  return jnp.cross(x1, x2, axis=axis)
+
+
+@_wraps(getattr(np.linalg, "outer", None))
+def outer(x1: ArrayLike, x2: ArrayLike, /) -> Array:
+  check_arraylike("jnp.linalg.outer", x1, x2)
+  x1, x2 = jnp.asarray(x1), jnp.asarray(x2)
+  if x1.ndim != 1 or x2.ndim != 1:
+    raise ValueError(f"Input arrays must be one-dimensional, but they are {x1.ndim=} {x2.ndim=}")
+  return x1[:, None] * x2[None, :]
+
+
+@_wraps(getattr(np.linalg, "matrix_norm", None))
+def matrix_norm(x: ArrayLike, /, *, keepdims: bool = False, ord: str = 'fro') -> Array:
+  """
+  Computes the matrix norm of a matrix (or a stack of matrices) x.
+  """
+  check_arraylike('jnp.linalg.matrix_norm', x)
+  return norm(x, ord=ord, keepdims=keepdims, axis=(-2, -1))
+
+
+@_wraps(getattr(np.linalg, "matrix_transpose", None))
+def matrix_transpose(x: ArrayLike, /) -> Array:
+  """Transposes a matrix (or a stack of matrices) x."""
+  check_arraylike('jnp.linalg.matrix_transpose', x)
+  x_arr = jnp.asarray(x)
+  ndim = x_arr.ndim
+  if ndim < 2:
+    raise ValueError(f"matrix_transpose requres at least 2 dimensions; got {ndim=}")
+  return jax.lax.transpose(x_arr, (*range(ndim - 2), ndim - 1, ndim - 2))
+
+
+@_wraps(getattr(np.linalg, "vector_norm", None))
+def vector_norm(x: ArrayLike, /, *, axis: int | None = None, keepdims: bool = False,
+                ord: int | str = 2) -> Array:
+  """Computes the vector norm of a vector (or batch of vectors) x."""
+  check_arraylike('jnp.linalg.vector_norm', x)
+  if axis is None:
+    result = norm(jnp.ravel(x), ord=ord)
+    if keepdims:
+      result = lax.expand_dims(result, range(jnp.ndim(x)))
+    return result
+  return norm(x, axis=axis, keepdims=keepdims, ord=ord)
+
+
+@_wraps(getattr(np.linalg, "vecdot", None))
+def vecdot(x1: ArrayLike, x2: ArrayLike, /, *, axis: int = -1) -> Array:
+  return jnp.vecdot(x1, x2, axis=axis)
+
+
+@_wraps(getattr(np.linalg, "matmul", None))
+def matmul(x1: ArrayLike, x2: ArrayLike, /) -> Array:
+  return jnp.matmul(x1, x2)
+
+
+@_wraps(getattr(np.linalg, "tensordot", None))
+def tensordot(x1: ArrayLike, x2: ArrayLike, /, *,
+              axes: int | tuple[Sequence[int], Sequence[int]] = 2) -> Array:
+  return jnp.tensordot(x1, x2, axes=axes)
+
+@_wraps(getattr(np.linalg, "svdvals", None))
+def svdvals(x: ArrayLike, /) -> Array:
+  return svd(x, compute_uv=False, hermitian=False)

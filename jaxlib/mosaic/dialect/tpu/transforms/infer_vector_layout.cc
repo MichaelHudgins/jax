@@ -26,6 +26,7 @@ limitations under the License.
 #include <variant>
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -45,6 +46,7 @@ limitations under the License.
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/include/mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/include/mlir/IR/Attributes.h"
+#include "mlir/include/mlir/IR/ImplicitLocOpBuilder.h"
 #include "jaxlib/mosaic/dialect/tpu/layout.h"
 #include "jaxlib/mosaic/dialect/tpu/tpu_dialect.h"
 #include "xla/layout.h"
@@ -114,8 +116,15 @@ class VectorLayoutInferer {
     for (Operation &any_op : block.without_terminator()) {
       VLOG(kLayoutLog) << Print(&any_op);
       if (any_op.hasAttr("in_layout") || any_op.hasAttr("out_layout")) {
-        any_op.emitOpError("layout attributes already attached");
-        return failure();
+        if (auto op = dyn_cast<tpu::AssumeLayoutOp>(any_op)) {
+          TPU_CHECK_OP(
+              any_op.hasAttr("in_layout") && any_op.hasAttr("out_layout"),
+              "expect layout attributes in tpu::AssumeLayoutOp");
+          continue;
+        } else {
+          any_op.emitOpError("layout attributes already attached");
+          return failure();
+        }
       }
       bool has_vector_io = false;
       for (auto op : any_op.getOperands()) {
@@ -407,30 +416,13 @@ class VectorLayoutInferer {
                  "Only 32-bit to 16-bit truncation supported");
     auto &layout = *some_layout;
     if (layout.implicit_dim() == ImplicitDim::kNone) {
-      bool only_feeds_into_matrix_ops = true;
-      for (OpOperand &operand : op->getUses()) {
-        if (isa<vector::ContractionOp>(operand.getOwner())) {
-          continue;
-        }
-        if (auto transpose =
-                dyn_cast<vector::TransposeOp>(operand.getOwner())) {
-          auto perm = transpose.getPermutation();
-          auto rank = perm.size();
-          if (rank >= 2 && perm[rank - 1] == rank - 2 &&
-              perm[rank - 2] == rank - 1) {
-            continue;
-          }
-          // Fall through.
-        }
-        only_feeds_into_matrix_ops = false;
-        break;
-      }
+      bool select_native = allUsersRequireNativeTiling(op.getResult());
       auto src_layout = VectorLayout(32, layout.offsets(), default_tiling_,
                                      ImplicitDim::kNone);
-      auto dst_layout = VectorLayout(
-          16, layout.offsets(),
-          only_feeds_into_matrix_ops ? nativeTiling(16) : default_tiling_,
-          ImplicitDim::kNone);
+      auto dst_layout =
+          VectorLayout(16, layout.offsets(),
+                       select_native ? nativeTiling(16) : default_tiling_,
+                       ImplicitDim::kNone);
       setLayout(op, src_layout, dst_layout);
       return success();
     }
@@ -482,12 +474,14 @@ class VectorLayoutInferer {
     TPU_CHECK_OP(some_layout.has_value(), "missing vector layout");
     auto &layout = *some_layout;
     if (layout.implicit_dim() == ImplicitDim::kNone) {
-      // TODO(apaszke): Support native layouts here.
       auto src_layout = VectorLayout(32, layout.offsets(), default_tiling_,
                                      ImplicitDim::kNone);
-      auto dst_layout =
-          VectorLayout(dst_ty.getElementTypeBitWidth(), layout.offsets(),
-                       default_tiling_, ImplicitDim::kNone);
+      bool select_native = allUsersRequireNativeTiling(op.getResult());
+      auto dst_layout = VectorLayout(
+          dst_ty.getElementTypeBitWidth(), layout.offsets(),
+          select_native ? nativeTiling(dst_ty.getElementTypeBitWidth())
+                        : default_tiling_,
+          ImplicitDim::kNone);
       setLayout(op, src_layout, dst_layout);
       return success();
     }
@@ -610,18 +604,59 @@ class VectorLayoutInferer {
       TPU_CHECK_OP(isa<scf::YieldOp>(op), "expected yield terminator");
       return success();
     };
-    // TODO(b/286175570) Support inputs and outputs in scf.for.
-    if (op.getNumRegionIterArgs() > 0 || op->getNumResults() > 0) {
-      NYI("support inputs and outputs in scf.for");
-    }
-    TPU_CHECK_OP(op.getNumOperands() == 3, "expected 3 operands in scf.for");
     TPU_CHECK_OP(op.getRegion().hasOneBlock(),
-                 "expected one block in scf.for loop body.");
-    if (inferBlock(op.getRegion().getBlocks().front(), match_yield).failed()) {
+                 "expected one block for scf.for");
+    TPU_CHECK_OP(
+        op.getNumRegionIterArgs() == op.getNumResults(),
+        "expected num_region_iter_args is equal to num_results in scf.for");
+    TPU_CHECK_OP(
+        op->getNumOperands() == 3 + op.getNumResults(),
+        "expected num_operands is equal to 3 + num_results in scf.for");
+
+    llvm::SmallVector<Layout, 4> in_layouts;
+    in_layouts.reserve(op->getNumOperands());
+    in_layouts.push_back(kNoLayout);  // Lower bound.
+    in_layouts.push_back(kNoLayout);  // Upper bound.
+    in_layouts.push_back(kNoLayout);  // Step.
+    for (const auto &arg : op.getInitArgs()) {
+      if (arg.getType().isSignlessIntOrIndexOrFloat()) {
+        in_layouts.push_back(kNoLayout);
+      } else if (isa<VectorType>(arg.getType())) {
+        auto layout = getLayout(arg);
+        in_layouts.push_back(layout);
+      } else {
+        op.emitOpError() << "unsupported arg type " << arg.getType()
+                         << " in scf::for";
+        return failure();
+      }
+    }
+    ArrayRef<Layout> out_layouts = ArrayRef<Layout>(in_layouts).drop_front(3);
+    // Use tpu.assume_layout to annotate every block argument with the layout of
+    // the corresponding operand in forOp and replace all uses of the block
+    // argument with the result of tpu.assume_layout.
+    ImplicitLocOpBuilder builder =
+        ImplicitLocOpBuilder::atBlockBegin(op.getLoc(), op.getBody());
+
+    // Drop the induction_variable and layouts of bounds+step (respectively).
+    for (auto [iter_arg, layout] : llvm::zip_equal(
+             op.getBody()->getArguments().drop_front(1), out_layouts)) {
+      if (!dyn_cast<VectorType>(iter_arg.getType())) {
+        continue;
+      }
+      auto assume_layout_op =
+          builder.create<AssumeLayoutOp>(iter_arg.getType(), iter_arg);
+      setLayout(assume_layout_op, layout, layout);
+      iter_arg.replaceUsesWithIf(assume_layout_op, [&](OpOperand &operand) {
+        return operand.getOwner() != assume_layout_op;
+      });
+    }
+
+    if (inferBlock(*op.getBody(), match_yield).failed()) {
       return failure();
     }
-    setInLayout(op, {/*lower_bound*/ kNoLayout, /*upper_bound*/ kNoLayout,
-                     /*step*/ kNoLayout});
+    auto yield_op = op.getBody()->getTerminator();
+    setInLayout(yield_op, out_layouts);
+    setLayout(op, in_layouts, out_layouts);
     return success();
   }
 
@@ -1510,6 +1545,26 @@ class VectorLayoutInferer {
               VectorLayout(kNativeBitwidth, {0, 0}, default_tiling_,
                            ImplicitDim::kNone));
     return success();
+  }
+
+  bool allUsersRequireNativeTiling(Value x) {
+    for (OpOperand &operand : x.getUses()) {
+      if (isa<vector::ContractionOp, tpu::MatmulOp>(operand.getOwner())) {
+        continue;
+      }
+      if (auto transpose = dyn_cast<vector::TransposeOp>(operand.getOwner())) {
+        auto perm = transpose.getPermutation();
+        auto rank = perm.size();
+        // Only permutations that actually swap the last two dims need it.
+        if (rank >= 2 && perm[rank - 1] == rank - 2 &&
+            perm[rank - 2] == rank - 1) {
+          continue;
+        }
+        // Fall through.
+      }
+      return false;
+    }
+    return true;
   }
 
   void setInLayout(Operation *op, ArrayRef<Layout> in) {
