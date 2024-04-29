@@ -158,6 +158,15 @@ build:linux --copt=-Wno-array-parameter
 
 build:macos --config=posix
 
+# Values for the release builds of JAX
+build:linux_release_base --config=mkl_open_source_only
+build:linux_release_base --verbose_failures=true
+build:linux_release_base --copt=-Wno-error=unused-command-line-argument
+build:linux_release_base --copt=-Wno-gnu-offsetof-extensions
+
+build:linux_release_x86 --config=linux_release_base
+build:linux_release_x86 --config=avx_posix
+
 # Public cache for macOS builds. The "oct2023" in the URL is just the
 # date when the bucket was created and can be disregarded. It still contains the
 # latest cache that is being used.
