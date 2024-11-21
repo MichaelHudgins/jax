@@ -1,0 +1,42 @@
+name: ARM64 CI
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+permissions:
+  contents: read  # to fetch code
+  actions: write  # to cancel previous workflows
+jobs:
+  build:
+    name: "build ${{ matrix.name-prefix }} py ${{ matrix.python-version }}"
+    runs-on: ${{ matrix.os }}
+    container:
+        image: ${{ matrix.container }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        # Test the oldest and newest supported Python versions here.
+        include:
+          - name-prefix: "with 3.12"
+            python-version: "3.12"
+            os: linux-arm64
+            container: gcr.io/tensorflow-sigs/build-arm64:jax-latest-multi-python
+    steps:
+    - name: Cancel previous
+      uses: styfle/cancel-workflow-action@0.12.0
+      with:
+        access_token: ${{ github.token }}
+      if: ${{github.ref != 'refs/heads/main'}}
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # ratchet:actions/checkout@v4
+    - name: Run tests
+      run: |
+        uname -a
+    - name: Halt if requested
+      run: sleep 150s
+      shell: bash
